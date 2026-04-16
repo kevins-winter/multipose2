@@ -1,7 +1,7 @@
 import time
 import numpy as np
 import pytest
-from cellpose import utils, models, vit_sam
+from multipose2 import utils, models, vit_sam
 import zipfile
 import torch
 import torch.nn.functional as F

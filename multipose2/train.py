@@ -1,8 +1,8 @@
 import time
 import os
 import numpy as np
-from cellpose import io, utils, models, dynamics
-from cellpose.transforms import normalize_img, random_rotate_and_resize
+from . import io, utils, models, dynamics
+from .transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
 import torch
 from torch import nn

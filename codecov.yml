@@ -1,6 +1,6 @@
 ignore:
-  - "cellpose/gui/*"
-  - "cellpose/contrib/*"
+  - "multipose2/gui/*"
+  - "multipose2/contrib/*"
 coverage:
   status:
     project:

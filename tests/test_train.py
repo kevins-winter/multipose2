@@ -1,4 +1,4 @@
-from cellpose import io, models, train
+from multipose2 import io, models, train
 from subprocess import check_output, STDOUT
 import os, shutil
 import torch
@@ -35,7 +35,7 @@ def test_cli_train(data_dir):
     shutil.rmtree(model_dir, ignore_errors=True)
     use_gpu = torch.cuda.is_available()
     gpu_str = "--use_gpu" if use_gpu else ""
-    cmd = 'python -m cellpose %s --train --n_epochs 3 --dir %s --mask_filter _cyto_masks --pretrained_model None' % (gpu_str, train_dir)
+    cmd = 'python -m multipose2 %s --train --n_epochs 3 --dir %s --mask_filter _cyto_masks --pretrained_model None' % (gpu_str, train_dir)
     try:
         cmd_stdout = check_output(cmd, stderr=STDOUT, shell=True).decode()
     except Exception as e:
@@ -44,7 +44,7 @@ def test_cli_train(data_dir):
 
 
 def test_cli_make_train(data_dir):
-    script_name = Path().resolve() / 'cellpose/gui/make_train.py'
+    script_name = Path().resolve() / 'multipose2/gui/make_train.py'
     image_path = data_dir / '3D/gray_3D.tif'
 
     cmd = f'python {script_name} --image_path {image_path}'

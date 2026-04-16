@@ -4,12 +4,12 @@ Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer ,
 import os, time
 import numpy as np
 from tqdm import tqdm
-from cellpose import utils, models, io, train
+from . import utils, models, io, train
 from .version import version_str
-from cellpose.cli import get_arg_parser
+from .cli import get_arg_parser
 
 try:
-    from cellpose.gui import gui3d, gui
+    from .gui import gui3d, gui
     GUI_ENABLED = True
 except ImportError as err:
     GUI_ERROR = err
@@ -25,7 +25,7 @@ import logging
 
 
 def main():
-    """ Run cellpose from command line
+    """Run multipose2 from command line.
     """
 
     args = get_arg_parser().parse_args()  # this has to be in a separate file for autodoc to work
@@ -46,7 +46,7 @@ def main():
                     print(
                         "GUI FAILED: GUI dependencies may not be installed, to install, run"
                     )
-                    print("     pip install 'cellpose[gui]'")
+                    print("     pip install 'multipose2[gui]'")
             else:
                 if args.Zstack:
                     gui3d.run()
@@ -54,7 +54,7 @@ def main():
                     gui.run()
             return
 
-    ############################## run cellpose on images ##############################
+    ############################## run multipose2 on images ##############################
     if args.verbose:
         from .io import logger_setup
         logger, log_file = logger_setup()
@@ -195,7 +195,7 @@ def _evaluate_cellposemodel_cli(args, logger, imf, device, pretrained_model, nor
             raise FileExistsError(f"--savedir {args.savedir} does not exist")
         
     logger.info(
-            ">>>> running cellpose on %d images using all channels" % nimg)
+            ">>>> running multipose2 on %d images using all channels" % nimg)
 
     # handle built-in model exceptions
     model = models.CellposeModel(device=device, pretrained_model=pretrained_model,)

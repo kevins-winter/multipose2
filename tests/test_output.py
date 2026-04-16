@@ -1,4 +1,4 @@
-from cellpose import io, metrics, utils, models
+from multipose2 import io, metrics, utils, models
 import pytest
 from subprocess import check_output, STDOUT
 from pathlib import Path
@@ -142,7 +142,7 @@ def test_cli_2D(data_dir, image_names):
     use_gpu = torch.cuda.is_available()
     gpu_string = "--use_gpu" if use_gpu else ""
     image_path_string = str(data_dir/"2D"/image_names[0])
-    cmd = f"python -m cellpose --image_path {image_path_string} --save_png --verbose {gpu_string}"
+    cmd = f"python -m multipose2 --image_path {image_path_string} --save_png --verbose {gpu_string}"
     try:
         cmd_stdout = check_output(cmd, stderr=STDOUT, shell=True).decode()
         print(cmd_stdout)
@@ -161,7 +161,7 @@ def test_cli_3D_diam_anisotropy_shape(data_dir, image_names_3d, diam, aniso):
     gpu_string = "--use_gpu" if use_gpu else ""
     anisotropy_text = f" {'--anisotropy ' + str(aniso) if aniso else ''}"
     diam_text = f" {'--diameter ' + str(diam) if diam else ''}"
-    cmd = f"python -m cellpose --image_path {str(data_dir / '3D' / image_names_3d[0])} --do_3D --save_tif {gpu_string} --verbose" + anisotropy_text + diam_text
+    cmd = f"python -m multipose2 --image_path {str(data_dir / '3D' / image_names_3d[0])} --do_3D --save_tif {gpu_string} --verbose" + anisotropy_text + diam_text
     print(cmd)
     try:
         cmd_stdout = check_output(cmd, stderr=STDOUT, shell=True).decode()
@@ -186,7 +186,7 @@ def test_cli_3D_one_img(data_dir, image_names_3d, flow3D_smooth):
     elif isinstance(flow3D_smooth, list):
         flow_string = f" --flow3D_smooth {' '.join([str(f) for f in flow3D_smooth])}"
 
-    cmd = f"python -m cellpose --image_path {str(data_dir / '3D' / image_names_3d[0])} --do_3D --save_tif {gpu_string} --verbose{flow_string}"
+    cmd = f"python -m multipose2 --image_path {str(data_dir / '3D' / image_names_3d[0])} --do_3D --save_tif {gpu_string} --verbose{flow_string}"
     print(cmd)
     try:
         cmd_stdout = check_output(cmd, stderr=STDOUT, shell=True).decode()

@@ -1,6 +1,6 @@
 import os, argparse
 import numpy as np
-from cellpose import io, transforms
+from .. import io, transforms
 
 
 def main():

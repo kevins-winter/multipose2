@@ -1,5 +1,5 @@
 import numpy as np
-from cellpose.utils import fill_holes_and_remove_small_masks
+from multipose2.utils import fill_holes_and_remove_small_masks
 import fastremap
 
 

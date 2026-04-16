@@ -4,10 +4,10 @@ import os, getpass, datetime, pathlib, tempfile, functools, glob
 # non-stdlib core dependencies
 import numpy as np
 import scipy
-import cellpose.io
-import cellpose.models
 import tifffile
 import imagecodecs
+from .. import io as multipose_io
+from .. import models as multipose_models
 
 # distributed dependencies
 import dask
@@ -520,8 +520,8 @@ def read_preprocess_and_segment(
     if worker_logs_directory is not None:
         log_file = f'dask_worker_{distributed.get_worker().name}.log'
         log_file = pathlib.Path(worker_logs_directory).joinpath(log_file)
-    cellpose.io.logger_setup(stdout_file_replacement=log_file)
-    model = cellpose.models.CellposeModel(**model_kwargs)
+    multipose_io.logger_setup(stdout_file_replacement=log_file)
+    model = multipose_models.CellposeModel(**model_kwargs)
     return model.eval(image, **eval_kwargs)[0].astype(np.uint32)
 
 
@@ -920,5 +920,4 @@ def merge_boxes(boxes):
             local_union.append(slice(start, stop))
         box_union = tuple(local_union)
     return box_union
-
 

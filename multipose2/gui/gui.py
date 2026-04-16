@@ -1608,7 +1608,7 @@ class MainW(QMainWindow):
 
 
     def set_normalize_params(self, normalize_params):
-        from cellpose.models import normalize_default
+        from ..models import normalize_default
         if self.restore != "filter":
             keys = list(normalize_params.keys()).copy()
             for key in keys:
@@ -1664,7 +1664,7 @@ class MainW(QMainWindow):
         normalize_params["tile_norm_smooth3D"] = smooth3D
         normalize_params["invert"] = invert
 
-        from cellpose.models import normalize_default
+        from ..models import normalize_default
         normalize_params = {**normalize_default, **normalize_params}
 
         return normalize_params
@@ -1814,7 +1814,7 @@ class MainW(QMainWindow):
             print("GUI_INFO: training cancelled")
 
     def train_model(self, restore=None, normalize_params=None):
-        from cellpose.models import normalize_default
+        from ..models import normalize_default
         if normalize_params is None:
             normalize_params = copy.deepcopy(normalize_default)
         model_type = models.MODEL_NAMES[self.training_params["model_index"]]

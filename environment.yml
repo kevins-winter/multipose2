@@ -1,4 +1,4 @@
-name: cellpose
+name: multipose2
 dependencies:
   - python==3.8.5
   - pip
@@ -15,7 +15,7 @@ dependencies:
     - tqdm
     - tifffile
     - fastremap
-    - cellpose
+    - multipose2
     - roifile
     - pyqt5
     - dask

@@ -13,7 +13,7 @@ import colorsys
 import fastremap
 import fill_voids
 from multiprocessing import Pool, cpu_count
-from cellpose import metrics
+from . import metrics
 
 try:
     from skimage.morphology import remove_small_holes

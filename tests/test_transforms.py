@@ -1,9 +1,9 @@
 import numpy as np
 import pytest
 
-from cellpose import transforms
-from cellpose.io import imread
-from cellpose.transforms import normalize_img, random_rotate_and_resize, resize_image
+from multipose2 import transforms
+from multipose2.io import imread
+from multipose2.transforms import normalize_img, random_rotate_and_resize, resize_image
 
 
 @pytest.fixture
