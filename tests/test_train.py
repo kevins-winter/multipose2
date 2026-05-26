@@ -15,6 +15,22 @@ def test_train_channel_guard_rebuilds_adapter():
     assert model.net.in_channels == 5
 
 
+def test_set_trainable_parameters_adapter_head():
+    model = models.CellposeModel(gpu=False, nchan=5)
+    train.set_trainable_parameters(model.net, trainable_mode="adapter_head")
+    trainable_names = [
+        name for name, param in model.net.named_parameters()
+        if param.requires_grad
+    ]
+    assert trainable_names
+    assert all(
+        name.startswith("input_adapter.") or name.startswith("out.")
+        for name in trainable_names
+    )
+    assert any(name.startswith("input_adapter.") for name in trainable_names)
+    assert any(name.startswith("out.") for name in trainable_names)
+
+
 def test_synthesize_multimodal_training_dir(tmp_path):
     he_dir = tmp_path / "H&EStain" / "Training"
     tx_dir = tmp_path / "UnremovedTranscripts" / "Training"

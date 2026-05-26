@@ -137,6 +137,41 @@ def _ensure_net_input_channels(net, nchan):
         f"training data have {nchan} channels but model expects {net.in_channels}"
     )
 
+
+def set_trainable_parameters(net, trainable_mode="all"):
+    """Select which network parameters are optimized during segmentation training."""
+    valid_modes = {"all", "adapter_head", "adapter_only", "head_only"}
+    if trainable_mode not in valid_modes:
+        raise ValueError(
+            f"trainable_mode must be one of {sorted(valid_modes)}, got {trainable_mode!r}"
+        )
+    for param in net.parameters():
+        param.requires_grad = trainable_mode == "all"
+    if trainable_mode == "all":
+        trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in net.parameters())
+        train_logger.info(
+            ">>> trainable_mode=%s, optimizing %d / %d parameters",
+            trainable_mode, trainable, total,
+        )
+        return
+
+    prefixes = []
+    if trainable_mode in {"adapter_head", "adapter_only"}:
+        prefixes.append("input_adapter.")
+    if trainable_mode in {"adapter_head", "head_only"}:
+        prefixes.append("out.")
+
+    for name, param in net.named_parameters():
+        param.requires_grad = any(name.startswith(prefix) for prefix in prefixes)
+
+    trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in net.parameters())
+    train_logger.info(
+        ">>> trainable_mode=%s, optimizing %d / %d parameters",
+        trainable_mode, trainable, total,
+    )
+
 def _reshape_norm_save(files, channels=None, channel_axis=None,
                        normalize_params={"normalize": False}):
     """ not currently used -- normalization happening on each batch if not load_files """
@@ -338,7 +373,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               n_epochs=100, weight_decay=0.1, normalize=True, compute_flows=False,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
-              min_train_masks=5, model_name=None, class_weights=None):
+              min_train_masks=5, model_name=None, class_weights=None,
+              trainable_mode="all"):
     """
     Train the network with images for segmentation.
 
@@ -370,6 +406,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         rescale (bool, optional): Boolean - whether or not to rescale images during training. Defaults to False.
         min_train_masks (int, optional): Integer - minimum number of masks an image must have to use in the training set. Defaults to 5.
         model_name (str, optional): String - name of the network. Defaults to None.
+        trainable_mode (str, optional): Which parameters to optimize. Use "all" for full fine-tuning, "adapter_head" for the input adapter and output head, "adapter_only" for only the input adapter, or "head_only" for only the output head. Defaults to "all".
 
     Returns:
         tuple: A tuple containing the path to the saved model weights, training losses, and test losses.
@@ -416,6 +453,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
     input_nchan = _infer_nchan(train_data, train_files, channel_axis=channel_axis)
     _ensure_net_input_channels(net, input_nchan)
+    set_trainable_parameters(net, trainable_mode=trainable_mode)
     
     net.diam_labels.data = torch.Tensor([diam_train.mean()]).to(device)
 
@@ -445,7 +483,10 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     train_logger.info(
         f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}"
     )
-    optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate,
+    trainable_params = [p for p in net.parameters() if p.requires_grad]
+    if len(trainable_params) == 0:
+        raise ValueError(f"trainable_mode={trainable_mode!r} selected no parameters")
+    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate,
                                     weight_decay=weight_decay)
 
     t0 = time.time()
