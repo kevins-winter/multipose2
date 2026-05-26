@@ -115,7 +115,7 @@ def download_and_normalize_image(path_dir_temp, channels=DEFAULT_CHANNELS):
         sys.stderr.write(f'Downloading: "{IMAGE_URL}" to {path_image}\n')
         download_url_to_file(IMAGE_URL, path_image)
     img = imread(path_image).astype(np.float32)
-    img = convert_image(img, channels, channel_axis=1, z_axis=0, do_3D=False, nchan=2)
+    img = convert_image(img, channel_axis=1, do_3D=False)
     img = normalize_img(img, **DEFAULT_NORMALIZE_PARAMS)
     img = np.transpose(img, (0, 3, 1, 2))
     img, _, _ = pad_image_ND(img)

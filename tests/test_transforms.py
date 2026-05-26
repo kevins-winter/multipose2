@@ -93,30 +93,36 @@ def test_resize(img_2d):
     assert img32.dtype == np.uint32
 
 
+def test_resize_preserves_singleton_channel():
+    img = np.zeros((64, 32, 1), dtype=np.float32)
+    img_rsz = resize_image(img, Ly=40, Lx=20)
+    assert img_rsz.shape == (40, 20, 1)
+
+
 @pytest.mark.parametrize(
         "input_shape, channel_axis, z_axis, do_3D, expected_shape, raises_error",
         [   # passing:
             # 2D:
-            ((100, 120), None, None, False, (100, 120, 3), False),  # 2D grayscale image
+            ((100, 120), None, None, False, (100, 120, 1), False),  # 2D grayscale image
             ((100, 120, 3), None, None, False, (100, 120, 3), False),  # 2D RGB image
             ((3, 100, 120), 0, None, False, (100, 120, 3), False),  # 2D RGB image with channels first
             ((3, 100, 120), None, None, False, (100, 120, 3), False),  # 2D RGB image with channels first
 
             # 3D:
-            ((100, 120, 5), None, -1, True, (5, 100, 120, 3), False),  # 3D grayscale image
-            ((5, 100, 120), None, 0, True, (5, 100, 120, 3), False),  # 3D grayscale image
-            ((100, 5, 120, 5), 1, 3, True, (5, 100, 120, 3), False),  # 3D 5chan image
-            ((10, 100, 120, 3), -1, 0, True, (10, 100, 120, 3), False),  # 3D 5chan image
+            ((100, 120, 5), None, -1, True, (5, 100, 120, 1), False),  # 3D grayscale image
+            ((5, 100, 120), None, 0, True, (5, 100, 120, 1), False),  # 3D grayscale image
+            ((100, 5, 120, 5), 1, 3, True, (5, 100, 120, 5), False),  # 3D multichannel image
+            ((10, 100, 120, 3), -1, 0, True, (10, 100, 120, 3), False),  # 3D RGB image
             
             # failing: 
             # 2D:
-            ((100, 120), None, 0, False, (100, 120, 3), True),  # 2D grayscale image
+            ((100, 120), None, 0, False, (100, 120, 1), True),  # 2D grayscale image
             ((100, 120, 3), None, None, True, (100, 120, 3), True),  # 2D RGB image
             ((3, 100, 120), -1, 2, False, (100, 120, 3), True),  # 2D RGB image with channels first
             ((3, 100, 120), None, None, True, (100, 120, 3), True),  # 2D RGB image with channels first
 
             # 3D:
-            ((5, 100, 120), None, None, True, (5, 100, 120, 3), True),  # 3D grayscale image
+            ((5, 100, 120), None, None, True, (5, 100, 120, 1), True),  # 3D grayscale image
             ((10, 100, 120, 3), -1, 0, False, (10, 100, 120, 3), True),  # 3D rgb image
         ],
     )
@@ -129,3 +135,15 @@ def test_convert_image(input_shape, channel_axis, z_axis, do_3D, expected_shape,
     else:
         converted_img = transforms.convert_image(img, channel_axis=channel_axis, z_axis=z_axis, do_3D=do_3D)
         assert converted_img.shape == expected_shape, f"Expected shape {expected_shape}, but got {converted_img.shape}"
+
+
+def test_convert_image_preserves_multichannel_2d():
+    img = np.random.rand(64, 48, 5).astype(np.float32)
+    converted_img = transforms.convert_image(img, do_3D=False)
+    assert converted_img.shape == (64, 48, 5)
+
+
+def test_convert_image_preserves_channel_first_2d():
+    img = np.random.rand(7, 64, 48).astype(np.float32)
+    converted_img = transforms.convert_image(img, channel_axis=0, do_3D=False)
+    assert converted_img.shape == (64, 48, 7)

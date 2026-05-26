@@ -7,6 +7,11 @@ def test_cellpose_imports_without_error():
     model = models.CellposeModel()
 
 
+def test_cellpose_multichannel_instantiates():
+    from multipose2 import models
+    model = models.CellposeModel(nchan=8)
+
+
 def test_model_zoo_imports_without_error():
     from multipose2 import models, denoise
     for model_name in models.MODEL_NAMES:

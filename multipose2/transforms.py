@@ -462,9 +462,8 @@ def _convert_image_3d(x, channel_axis=None, z_axis=None):
             Must be specified for both 3D and 4D images.
 
     Returns:
-        numpy.ndarray: A 4D image array with dimensions ordered as (Z, X, Y, C), where C is the channel 
-        dimension. If the input has fewer than 3 channels, the output will be padded with zeros to \
-            have 3 channels. If the input has more than 3 channels, only the first 3 channels will be retained.
+        numpy.ndarray: A 4D image array with dimensions ordered as (Z, X, Y, C), where C is the
+        channel dimension.
     
     Raises:
         ValueError: If `z_axis` is not specified for 3D images. If either `channel_axis` or `z_axis` \
@@ -473,8 +472,6 @@ def _convert_image_3d(x, channel_axis=None, z_axis=None):
     Notes:
         - For 3D images (ndim=3), the function assumes the input is grayscale and adds a singleton channel dimension.
         - The function reorders the dimensions of the input array to ensure the output has the desired (Z, X, Y, C) order.
-        - If the number of channels is not equal to 3, the function either truncates or pads the \
-            channels to ensure the output has exactly 3 channels.
     """
 
     if x.ndim < 3:
@@ -501,8 +498,6 @@ def _convert_image_3d(x, channel_axis=None, z_axis=None):
     assert x.ndim == 4, f"input image must have ndim == 4, ndim={x.ndim}"
     
     x_dim_shapes = list(x.shape)
-    num_z_layers = x_dim_shapes[z_axis]
-    num_channels = x_dim_shapes[channel_axis]
     x_xy_axes = [i for i in range(x.ndim)]
     
     # need to remove the z and channels from the shapes:
@@ -523,24 +518,11 @@ def _convert_image_3d(x, channel_axis=None, z_axis=None):
 
     x = x.transpose((z_axis, x_xy_axes[0], x_xy_axes[1], channel_axis))
 
-    # Handle cases with not 3 channels:
-    if num_channels != 3:
-        x_chans_to_copy = min(3, num_channels)
-
-        if num_channels > 3:
-            transforms_logger.warning("more than 3 channels provided, only segmenting on first 3 channels")
-            x = x[..., :x_chans_to_copy]
-        else: 
-            # less than 3 channels: pad up to 
-            pad_width = [(0, 0), (0, 0), (0, 0), (0, 3 - x_chans_to_copy)]
-            x = np.pad(x, pad_width, mode='constant', constant_values=0)
-
     return x
 
 
 def convert_image(x, channel_axis=None, z_axis=None, do_3D=False):
-    """Converts the image to have the z-axis first, channels last. Image will be converted to 3 channels if it is not already.
-    If more than 3 channels are provided, only the first 3 channels will be used. 
+    """Converts the image to have the z-axis first, channels last while preserving channel count.
 
     Accepts: 
         - 2D images with no channel dimension: `z_axis` and `channel_axis` must be `None`
@@ -591,27 +573,12 @@ def convert_image(x, channel_axis=None, z_axis=None, do_3D=False):
 
         x = x.transpose((dimension_indicies[0], dimension_indicies[1], channel_axis))
 
-        if n_channels != 3:
-            x_chans_to_copy = min(3, n_channels)
-
-            if n_channels > 3: 
-                transforms_logger.warning("more than 3 channels provided, only segmenting on first 3 channels")
-                x = x[..., :x_chans_to_copy]
-            else: 
-                x_out = np.zeros((x_shape_dims[0], x_shape_dims[1], 3), dtype=x.dtype)
-                x_out[..., :x_chans_to_copy] = x[...]
-                x = x_out
-                del x_out
-
         return x
 
     # do image padding and channel conversion
     if ndim == 2:
-        # grayscale image, make 3 channels
-        x_out = np.zeros((x.shape[0], x.shape[1], 3), dtype=x.dtype)
-        x_out[..., 0] = x
-        x = x_out
-        del x_out
+        # grayscale image, keep a singleton channel axis
+        x = x[..., np.newaxis]
         transforms_logger.debug(f'processing grayscale image with {x.shape[0], x.shape[1]} HW')
     elif ndim == 3:
         # assume 2d with channels
@@ -619,29 +586,9 @@ def convert_image(x, channel_axis=None, z_axis=None, do_3D=False):
         move_channel_axis = x.shape[0] < x.shape[2]
         if move_channel_axis:
             x = x.transpose((1, 2, 0))
-
-        # zero padding up to 3 channels: 
-        num_channels = x.shape[-1]
-        if num_channels > 3: 
-            transforms_logger.warning("Found more than 3 channels, only using first 3")
-            num_channels = 3
-        x_out = np.zeros((x.shape[0], x.shape[1], 3), dtype=x.dtype)
-        x_out[..., :num_channels] = x[..., :num_channels]
-        x = x_out
-        del x_out
         transforms_logger.debug(f'processing image with {x.shape[0], x.shape[1]} HW, and {x.shape[2]} channels')
     elif ndim == 4:
         # assume batch of 2d with channels
-
-        # zero padding up to 3 channels: 
-        num_channels = x.shape[-1]
-        if num_channels > 3: 
-            transforms_logger.warning("Found more than 3 channels, only using first 3")
-            num_channels = 3
-        x_out = np.zeros((x.shape[0], x.shape[1], x.shape[2], 3), dtype=x.dtype)
-        x_out[..., :num_channels] = x[..., :num_channels]
-        x = x_out
-        del x_out
         transforms_logger.debug(f'processing image batch with {x.shape[0]} images, {x.shape[1], x.shape[2]} HW, and {x.shape[3]} channels')
     else:
         # something is wrong: yell
@@ -812,6 +759,9 @@ def resize_safe(img, Ly, Lx, interpolation=cv2.INTER_LINEAR):
 
     """
 
+    # OpenCV drops a trailing singleton channel, so preserve it explicitly.
+    keep_singleton_channel = img.ndim == 3 and img.shape[-1] == 1
+
     # cast image
     cast = img.dtype == np.uint32
     if cast:
@@ -819,6 +769,9 @@ def resize_safe(img, Ly, Lx, interpolation=cv2.INTER_LINEAR):
 
     # resize
     img = cv2.resize(img, (Lx, Ly), interpolation=interpolation)
+
+    if keep_singleton_channel and img.ndim == 2:
+        img = img[..., np.newaxis]
 
     # cast back
     if cast:

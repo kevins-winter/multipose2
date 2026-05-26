@@ -109,8 +109,6 @@ class CellposeModel():
             models_logger.warning(
                 "model_type argument is not used in v4.0.1+. Ignoring this argument..."
             )
-        if nchan is not None:
-            models_logger.warning("nchan argument is deprecated in v4.0.1+. Ignoring this argument")
 
         ### assign model device
         self.device = assign_device(gpu=gpu)[0] if device is None else device
@@ -141,8 +139,15 @@ class CellposeModel():
 
         self.pretrained_model = pretrained_model
         dtype = torch.bfloat16 if use_bfloat16 else torch.float32
-        self.net = Transformer(dtype=dtype).to(self.device)
+        self.nchan = nchan
+        self._net_dtype = dtype
+        if self.nchan is None:
+            models_logger.info(
+                "nchan not provided; defaulting to a 3-channel adapter until input data is seen."
+            )
+        self._init_net(self.nchan or 3)
 
+    def _load_pretrained_weights(self):
         if os.path.exists(self.pretrained_model):
             models_logger.info(f">>>> loading model {self.pretrained_model}")
             self.net.load_model(self.pretrained_model, device=self.device)
@@ -151,6 +156,11 @@ class CellposeModel():
                 raise FileNotFoundError('model file not recognized')
             cache_CPSAM_model_path()
             self.net.load_model(self.pretrained_model, device=self.device)
+
+    def _init_net(self, nchan):
+        self.nchan = nchan
+        self.net = Transformer(dtype=self._net_dtype, in_channels=nchan).to(self.device)
+        self._load_pretrained_weights()
         
         
     def eval(self, x, batch_size=8, resample=True, channels=None, channel_axis=None,
@@ -160,10 +170,10 @@ class CellposeModel():
              min_size=15, max_size_fraction=0.4, niter=None, 
              augment=False, tile_overlap=0.1, bsize=256, 
              compute_masks=True, progress=None):
-        """ segment list of images x, or 4D array - Z x 3 x Y x X
+        """ segment list of images x, or 4D array - Z x C x Y x X
 
         Args:
-            x (list, np.ndarry): can be list of 2D/3D/4D images, or array of 2D/3D/4D images. Images must have 3 channels.
+            x (list, np.ndarry): can be list of 2D/3D/4D images, or array of 2D/3D/4D images.
             batch_size (int, optional): number of 256x256 patches to run simultaneously on the GPU
                 (can make smaller or bigger depending on GPU memory usage). Defaults to 64.
             resample (bool, optional): run dynamics at original image size (will be slower but create more accurate boundaries). 
@@ -267,6 +277,14 @@ class CellposeModel():
         if x.ndim < 4:
             x = x[np.newaxis, ...]
         nimg = x.shape[0]
+        input_nchan = x.shape[-1]
+        if getattr(self.net, "in_channels", None) != input_nchan:
+            models_logger.warning(
+                "Input has %d channels but model adapter expects %s channels; rebuilding the input adapter and reloading weights.",
+                input_nchan,
+                getattr(self.net, "in_channels", "unknown"),
+            )
+            self._init_net(input_nchan)
         
         image_scaling = 1.0
         if diameter is not None and diameter > 0:

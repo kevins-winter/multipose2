@@ -269,14 +269,13 @@ def imread(filename):
 
 def imread_2D(img_file):
     """
-    Read in a 2D image file and convert it to a 3-channel image. Attempts to do this for multi-channel and grayscale images.
-    If the image has more than 3 channels, only the first 3 channels are kept.
+    Read in a 2D image file and convert it to channels-last format while preserving channel count.
     
     Args:
         img_file (str): The path to the image file.
 
     Returns:
-        img_out (numpy.ndarray): The 3-channel image data as a NumPy array.
+        img_out (numpy.ndarray): The image data as a NumPy array with shape ``H x W x C``.
     """
     img = imread(img_file)
     if img is None:

@@ -76,15 +76,16 @@ def cellposemodel_fixture_2layer():
 
 
 class MockTransformer(vit_sam.Transformer):
-    def __init__(self, use_layers: int):
+    def __init__(self, use_layers: int, in_channels: int = 3):
         """ use_layers: the number of layers use starting from the first layer """
-        super().__init__()
+        super().__init__(in_channels=in_channels)
 
         self.use_layers = use_layers
         self.layer_idxs = np.linspace(0, 23, self.use_layers, dtype=int)
 
     def forward(self, x):
         # same progression as SAM until readout
+        x = self.input_adapter(x)
         x = self.encoder.patch_embed(x)
         
         if self.encoder.pos_embed is not None:
@@ -105,10 +106,10 @@ class MockTransformer(vit_sam.Transformer):
 
 
 class MockCellposeModel(models.CellposeModel):
-    def __init__(self, n_keep_layers=2, gpu=False):
-        super().__init__(gpu=gpu)
+    def __init__(self, n_keep_layers=2, gpu=False, nchan=3):
+        super().__init__(gpu=gpu, nchan=nchan)
 
-        self.net = MockTransformer(n_keep_layers)
+        self.net = MockTransformer(n_keep_layers, in_channels=nchan)
         self.net.to(self.device)
         self.net.load_model(Path().home() / '.cellpose/models/cpsam', device=self.device)
 

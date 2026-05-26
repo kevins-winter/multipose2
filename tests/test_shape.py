@@ -1,5 +1,8 @@
 import numpy as np
 import pytest
+import torch
+
+from conftest import MockCellposeModel
 
 
 #################### 2D Tests ####################
@@ -46,6 +49,14 @@ def test_shape_2D_2chan_specify(cellposemodel_fixture_24layer):
     assert masks.shape == (224, 224), 'mask shape mismatch'
     assert flows[1].shape == (2, 224, 224), 'dP shape mismatch'
     assert flows[2].shape == (224, 224), 'cellprob shape mismatch'
+
+
+def test_shape_2D_5chan_explicit_model():
+    model = MockCellposeModel(n_keep_layers=2, nchan=5)
+    x = np.zeros((1, 5, 256, 256), dtype=np.float32)
+    y, style = model.net(torch.from_numpy(x).to(model.device))
+    assert y.shape == (1, 3, 256, 256), 'network output shape mismatch'
+    assert style.shape == (1, 256), 'style shape mismatch'
     
 
 #################### 3D Tests ####################

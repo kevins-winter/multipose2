@@ -3,25 +3,31 @@ Copyright © 2025 Howard Hughes Medical Institute, Authored by Carsen Stringer a
 """
 
 import torch
+import logging
 from segment_anything import sam_model_registry
 torch.backends.cuda.matmul.allow_tf32 = True
 from torch import nn 
 import torch.nn.functional as F
 
+vit_logger = logging.getLogger(__name__)
+
 class Transformer(nn.Module):
     def __init__(self, backbone="vit_l", ps=8, nout=3, bsize=256, rdrop=0.4,
-                  checkpoint=None, dtype=torch.float32):
+                  checkpoint=None, dtype=torch.float32, in_channels=3):
         super(Transformer, self).__init__()
 
         # instantiate the vit model, default to not loading SAM
         # checkpoint = sam_vit_l_0b3195.pth is standard pretrained SAM
         self.encoder = sam_model_registry[backbone](checkpoint).image_encoder
         w = self.encoder.patch_embed.proj.weight.detach()
-        nchan = w.shape[0]
+        embed_dim = w.shape[0]
+        self.in_channels = in_channels
+        self.input_adapter = nn.Conv2d(in_channels, 3, kernel_size=1)
+        self._init_input_adapter()
         
         # change token size to ps x ps
         self.ps = ps
-        self.encoder.patch_embed.proj = nn.Conv2d(3, nchan, stride=ps, kernel_size=ps)
+        self.encoder.patch_embed.proj = nn.Conv2d(3, embed_dim, stride=ps, kernel_size=ps)
         self.encoder.patch_embed.proj.weight.data = w[:,:,::16//ps,::16//ps]
         
         # adjust position embeddings for new bsize and new token size
@@ -53,8 +59,17 @@ class Transformer(nn.Module):
         if dtype != torch.float32:
             self.dtype = dtype
 
+    def _init_input_adapter(self):
+        with torch.no_grad():
+            self.input_adapter.weight.zero_()
+            self.input_adapter.bias.zero_()
+            ncopy = min(self.in_channels, 3)
+            for c in range(ncopy):
+                self.input_adapter.weight[c, c, 0, 0] = 1.0
+
     def forward(self, x):      
         # same progression as SAM until readout
+        x = self.input_adapter(x)
         x = self.encoder.patch_embed(x)
         
         if self.encoder.pos_embed is not None:
@@ -97,9 +112,24 @@ class Transformer(nn.Module):
             for k, v in state_dict.items():
                 name = k[7:] # remove 'module.' of DataParallel/DistributedDataParallel
                 new_state_dict[name] = v
-            self.load_state_dict(new_state_dict, strict = strict)
+            incompatible = self.load_state_dict(new_state_dict, strict = strict)
         else:
-            self.load_state_dict(state_dict, strict = strict)
+            incompatible = self.load_state_dict(state_dict, strict = strict)
+
+        adapter_keys = {"input_adapter.weight", "input_adapter.bias"}
+        missing_adapter = sorted(adapter_keys.intersection(set(incompatible.missing_keys)))
+        if missing_adapter:
+            vit_logger.warning(
+                "Checkpoint %s does not contain %s; the new input adapter will use its initialized weights.",
+                PATH,
+                ", ".join(missing_adapter),
+            )
+        if incompatible.unexpected_keys:
+            vit_logger.warning(
+                "Unexpected checkpoint keys while loading %s: %s",
+                PATH,
+                ", ".join(incompatible.unexpected_keys),
+            )
 
         if self.dtype != torch.float32:
             self = self.to(self.dtype)
@@ -207,4 +237,3 @@ class CPnetBioImageIO(Transformer):
 
 
     
-
