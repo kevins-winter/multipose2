@@ -138,13 +138,38 @@ def _ensure_net_input_channels(net, nchan):
     )
 
 
-def set_trainable_parameters(net, trainable_mode="all"):
+def _last_encoder_block_prefixes(net, n_trainable_blocks):
+    """Return parameter name prefixes for the final SAM encoder blocks."""
+    if n_trainable_blocks < 1:
+        return []
+    blocks = getattr(getattr(net, "encoder", None), "blocks", None)
+    if blocks is None:
+        raise ValueError(
+            "trainable_mode='adapter_head_last_blocks' requires net.encoder.blocks"
+        )
+    n_blocks = len(blocks)
+    if n_trainable_blocks > n_blocks:
+        train_logger.warning(
+            "requested %d trainable encoder blocks, but network only has %d; using all blocks",
+            n_trainable_blocks, n_blocks,
+        )
+        n_trainable_blocks = n_blocks
+    start = n_blocks - n_trainable_blocks
+    return [f"encoder.blocks.{i}." for i in range(start, n_blocks)]
+
+
+def set_trainable_parameters(net, trainable_mode="all", n_trainable_blocks=2):
     """Select which network parameters are optimized during segmentation training."""
-    valid_modes = {"all", "adapter_head", "adapter_only", "head_only"}
+    valid_modes = {
+        "all", "adapter_head", "adapter_head_last_blocks", "adapter_only",
+        "head_only",
+    }
     if trainable_mode not in valid_modes:
         raise ValueError(
             f"trainable_mode must be one of {sorted(valid_modes)}, got {trainable_mode!r}"
         )
+    if n_trainable_blocks < 0:
+        raise ValueError("n_trainable_blocks must be >= 0")
     for param in net.parameters():
         param.requires_grad = trainable_mode == "all"
     if trainable_mode == "all":
@@ -157,10 +182,13 @@ def set_trainable_parameters(net, trainable_mode="all"):
         return
 
     prefixes = []
-    if trainable_mode in {"adapter_head", "adapter_only"}:
+    if trainable_mode in {"adapter_head", "adapter_head_last_blocks", "adapter_only"}:
         prefixes.append("input_adapter.")
-    if trainable_mode in {"adapter_head", "head_only"}:
+    if trainable_mode in {"adapter_head", "adapter_head_last_blocks", "head_only"}:
         prefixes.append("out.")
+    if trainable_mode == "adapter_head_last_blocks":
+        prefixes.extend(_last_encoder_block_prefixes(net, n_trainable_blocks))
+        prefixes.append("encoder.neck.")
 
     for name, param in net.named_parameters():
         param.requires_grad = any(name.startswith(prefix) for prefix in prefixes)
@@ -168,8 +196,8 @@ def set_trainable_parameters(net, trainable_mode="all"):
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     total = sum(p.numel() for p in net.parameters())
     train_logger.info(
-        ">>> trainable_mode=%s, optimizing %d / %d parameters",
-        trainable_mode, trainable, total,
+        ">>> trainable_mode=%s, n_trainable_blocks=%d, optimizing %d / %d parameters",
+        trainable_mode, n_trainable_blocks, trainable, total,
     )
 
 def _reshape_norm_save(files, channels=None, channel_axis=None,
@@ -374,7 +402,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
               min_train_masks=5, model_name=None, class_weights=None,
-              trainable_mode="all"):
+              trainable_mode="all", n_trainable_blocks=2):
     """
     Train the network with images for segmentation.
 
@@ -406,7 +434,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         rescale (bool, optional): Boolean - whether or not to rescale images during training. Defaults to False.
         min_train_masks (int, optional): Integer - minimum number of masks an image must have to use in the training set. Defaults to 5.
         model_name (str, optional): String - name of the network. Defaults to None.
-        trainable_mode (str, optional): Which parameters to optimize. Use "all" for full fine-tuning, "adapter_head" for the input adapter and output head, "adapter_only" for only the input adapter, or "head_only" for only the output head. Defaults to "all".
+        trainable_mode (str, optional): Which parameters to optimize. Use "all" for full fine-tuning, "adapter_head" for the input adapter and output head, "adapter_head_last_blocks" for the input adapter, output head, encoder neck, and the final SAM encoder blocks, "adapter_only" for only the input adapter, or "head_only" for only the output head. Defaults to "all".
+        n_trainable_blocks (int, optional): Number of final SAM encoder blocks to train when trainable_mode="adapter_head_last_blocks". Defaults to 2.
 
     Returns:
         tuple: A tuple containing the path to the saved model weights, training losses, and test losses.
@@ -453,7 +482,10 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
     input_nchan = _infer_nchan(train_data, train_files, channel_axis=channel_axis)
     _ensure_net_input_channels(net, input_nchan)
-    set_trainable_parameters(net, trainable_mode=trainable_mode)
+    set_trainable_parameters(
+        net, trainable_mode=trainable_mode,
+        n_trainable_blocks=n_trainable_blocks,
+    )
     
     net.diam_labels.data = torch.Tensor([diam_train.mean()]).to(device)
 

@@ -31,6 +31,43 @@ def test_set_trainable_parameters_adapter_head():
     assert any(name.startswith("out.") for name in trainable_names)
 
 
+def test_set_trainable_parameters_adapter_head_last_blocks():
+    model = models.CellposeModel(gpu=False, nchan=5)
+    n_blocks = len(model.net.encoder.blocks)
+    train.set_trainable_parameters(
+        model.net, trainable_mode="adapter_head_last_blocks",
+        n_trainable_blocks=2,
+    )
+    trainable_names = [
+        name for name, param in model.net.named_parameters()
+        if param.requires_grad
+    ]
+    assert trainable_names
+    assert any(name.startswith("input_adapter.") for name in trainable_names)
+    assert any(name.startswith("out.") for name in trainable_names)
+    assert any(name.startswith("encoder.neck.") for name in trainable_names)
+    assert any(
+        name.startswith(f"encoder.blocks.{n_blocks - 1}.")
+        for name in trainable_names
+    )
+    assert any(
+        name.startswith(f"encoder.blocks.{n_blocks - 2}.")
+        for name in trainable_names
+    )
+    assert not any(
+        name.startswith(f"encoder.blocks.{n_blocks - 3}.")
+        for name in trainable_names
+    )
+    assert all(
+        name.startswith("input_adapter.") or
+        name.startswith("out.") or
+        name.startswith("encoder.neck.") or
+        name.startswith(f"encoder.blocks.{n_blocks - 1}.") or
+        name.startswith(f"encoder.blocks.{n_blocks - 2}.")
+        for name in trainable_names
+    )
+
+
 def test_synthesize_multimodal_training_dir(tmp_path):
     he_dir = tmp_path / "H&EStain" / "Training"
     tx_dir = tmp_path / "UnremovedTranscripts" / "Training"
