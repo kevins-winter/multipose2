@@ -392,7 +392,50 @@ def _is_training_image_file(path, mask_filter, image_extensions):
     return path.suffix.lower() in image_extensions
 
 
-def _find_matching_modality_file(directory, sample_id, image_extensions):
+def _sample_id_from_path(path, sample_id_regex=None, mask_filter=None):
+    name = path.name
+    stem = path.stem
+    if mask_filter and name.endswith(mask_filter):
+        stem = name[:-len(mask_filter)]
+    elif mask_filter and "." not in mask_filter and stem.endswith(mask_filter):
+        stem = stem[:-len(mask_filter)]
+    if sample_id_regex is None:
+        return stem
+    match = re.search(sample_id_regex, stem)
+    if match is None:
+        raise ValueError(
+            f"sample_id_regex {sample_id_regex!r} did not match {path.name!r}"
+        )
+    if match.groups():
+        return "_".join(group for group in match.groups() if group is not None)
+    return match.group(0)
+
+
+def _index_files_by_sample_id(files, sample_id_regex=None, mask_filter=None):
+    indexed = {}
+    for path in files:
+        sample_id = _sample_id_from_path(
+            path, sample_id_regex=sample_id_regex, mask_filter=mask_filter
+        )
+        indexed.setdefault(sample_id, []).append(path)
+    return indexed
+
+
+def _unique_index_match(indexed, sample_id, directory, kind):
+    matches = indexed.get(sample_id, [])
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(
+            f"Multiple {kind} files match sample {sample_id!r} in {directory}: {matches}"
+        )
+    raise FileNotFoundError(
+        f"No {kind} file found for sample {sample_id!r} in {directory}"
+    )
+
+
+def _find_matching_modality_file(directory, sample_id, image_extensions,
+                                 sample_id_regex=None):
     for ext in image_extensions:
         candidate = directory / f"{sample_id}{ext}"
         if candidate.exists():
@@ -403,10 +446,16 @@ def _find_matching_modality_file(directory, sample_id, image_extensions):
     ]
     if matches:
         return sorted(matches)[0]
+    if sample_id_regex is not None:
+        indexed = _index_files_by_sample_id(
+            [p for p in directory.iterdir() if p.suffix.lower() in image_extensions],
+            sample_id_regex=sample_id_regex,
+        )
+        return _unique_index_match(indexed, sample_id, directory, "image")
     raise FileNotFoundError(f"No image found for sample {sample_id!r} in {directory}")
 
 
-def _find_matching_label_file(directory, sample_id, mask_filter):
+def _find_matching_label_file(directory, sample_id, mask_filter, sample_id_regex=None):
     candidates = []
     if mask_filter:
         if "." in mask_filter:
@@ -426,6 +475,15 @@ def _find_matching_label_file(directory, sample_id, mask_filter):
     for candidate in candidates:
         if candidate.exists():
             return candidate
+    if sample_id_regex is not None:
+        label_files = [
+            p for p in directory.iterdir()
+            if mask_filter in p.name or "_seg" in p.name or "_masks" in p.name
+        ]
+        indexed = _index_files_by_sample_id(
+            label_files, sample_id_regex=sample_id_regex, mask_filter=mask_filter
+        )
+        return _unique_index_match(indexed, sample_id, directory, "label")
     raise FileNotFoundError(
         f"No label found for sample {sample_id!r} in {directory}"
     )
@@ -436,7 +494,8 @@ def synthesize_multimodal_training_dir(modality_dirs, output_dir, label_dir=None
                                        modality_channel_axes=None,
                                        image_extensions=(".tif", ".tiff", ".png",
                                                          ".jpg", ".jpeg"),
-                                       output_suffix=".tif", overwrite=False):
+                                       output_suffix=".tif", overwrite=False,
+                                       sample_id_regex=None):
     """Fuse matched modality folders into a standard Multipose training folder.
 
     Args:
@@ -456,6 +515,10 @@ def synthesize_multimodal_training_dir(modality_dirs, output_dir, label_dir=None
         output_suffix (str, optional): Extension for fused images. Defaults to
             ``".tif"``.
         overwrite (bool, optional): Overwrite existing fused images/labels.
+        sample_id_regex (str, optional): Regex used to normalize non-identical
+            filenames across modality and label directories. Capture groups are
+            joined with underscores to form the sample id; if there are no
+            capture groups, the full match is used.
 
     Returns:
         Path: The output directory, suitable for ``load_train_test_data``.
@@ -496,10 +559,12 @@ def synthesize_multimodal_training_dir(modality_dirs, output_dir, label_dir=None
 
     fused_files = []
     for primary_file in tqdm(primary_files, desc="synthesizing multimodal train_dir"):
-        sample_id = primary_file.stem
+        sample_id = _sample_id_from_path(primary_file, sample_id_regex)
         fused_path = output_dir / f"{sample_id}{output_suffix}"
-        label_path = _find_matching_label_file(label_dir, sample_id, mask_filter)
-        out_label_path = output_dir / label_path.name
+        label_path = _find_matching_label_file(
+            label_dir, sample_id, mask_filter, sample_id_regex=sample_id_regex
+        )
+        out_label_path = output_dir / f"{sample_id}{mask_filter}"
 
         if not overwrite and fused_path.exists() and out_label_path.exists():
             fused_files.append(fused_path)
@@ -509,7 +574,8 @@ def synthesize_multimodal_training_dir(modality_dirs, output_dir, label_dir=None
         for name, directory in modality_dirs.items():
             path = (primary_file if name == primary_name else
                     _find_matching_modality_file(directory, sample_id,
-                                                 image_extensions))
+                                                 image_extensions,
+                                                 sample_id_regex=sample_id_regex))
             img = imread(str(path))
             img = transforms.convert_image(
                 img,
