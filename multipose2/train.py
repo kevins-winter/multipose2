@@ -107,6 +107,36 @@ def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
         lbls = [labels[i][1:] for i in inds]
     return imgs, lbls
 
+
+def _infer_nchan(data=None, files=None, channel_axis=None):
+    if data is not None and len(data) > 0:
+        sample = data[0]
+        if sample.ndim == 2:
+            return 1
+        return sample.shape[0]
+    if files is not None and len(files) > 0:
+        sample = _reshape_norm([io.imread(files[0])], channel_axis=channel_axis)[0]
+        return sample.shape[0]
+    return None
+
+
+def _ensure_net_input_channels(net, nchan):
+    if nchan is None or not hasattr(net, "in_channels"):
+        return
+    if net.in_channels == nchan:
+        return
+    if hasattr(net, "set_input_adapter"):
+        train_logger.warning(
+            "training data have %d channels but model adapter expects %d; rebuilding input adapter before training",
+            nchan,
+            net.in_channels,
+        )
+        net.set_input_adapter(nchan)
+        return
+    raise ValueError(
+        f"training data have {nchan} channels but model expects {net.in_channels}"
+    )
+
 def _reshape_norm_save(files, channels=None, channel_axis=None,
                        normalize_params={"normalize": False}):
     """ not currently used -- normalization happening on each batch if not load_files """
@@ -383,6 +413,9 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         kwargs = {}
     else:
         kwargs = {"normalize_params": normalize_params, "channel_axis": channel_axis}
+
+    input_nchan = _infer_nchan(train_data, train_files, channel_axis=channel_axis)
+    _ensure_net_input_channels(net, input_nchan)
     
     net.diam_labels.data = torch.Tensor([diam_train.mean()]).to(device)
 

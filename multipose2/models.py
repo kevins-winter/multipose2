@@ -89,7 +89,8 @@ class CellposeModel():
     """
 
     def __init__(self, gpu=False, pretrained_model="cpsam", model_type=None,
-                 diam_mean=None, device=None, nchan=None, use_bfloat16=True):
+                 diam_mean=None, device=None, nchan=None, use_bfloat16=True,
+                 adapter_type="linear"):
         """
         Initialize the CellposeModel.
 
@@ -100,6 +101,7 @@ class CellposeModel():
             diam_mean (float, optional): Mean "diameter", 30. is built-in value for "cyto" model; 17. is built-in value for "nuclei" model; if saved in custom model file (cellpose>=2.0) then it will be loaded automatically and overwrite this value.
             device (torch device, optional): Device used for model running / training (torch.device("cuda") or torch.device("cpu")), overrides gpu input, recommended if you want to use a specific GPU (e.g. torch.device("cuda:1")).
             use_bfloat16 (bool, optional): Use 16bit float precision instead of 32bit for model weights. Default to 16bit (True).
+            adapter_type (str, optional): Input adapter used to map image channels to the 3-channel SAM backbone input. Defaults to "linear".
         """
         if diam_mean is not None:
             models_logger.warning(
@@ -140,6 +142,7 @@ class CellposeModel():
         self.pretrained_model = pretrained_model
         dtype = torch.bfloat16 if use_bfloat16 else torch.float32
         self.nchan = nchan
+        self.adapter_type = adapter_type
         self._net_dtype = dtype
         if self.nchan is None:
             models_logger.info(
@@ -159,7 +162,8 @@ class CellposeModel():
 
     def _init_net(self, nchan):
         self.nchan = nchan
-        self.net = Transformer(dtype=self._net_dtype, in_channels=nchan).to(self.device)
+        self.net = Transformer(dtype=self._net_dtype, in_channels=nchan,
+                               adapter_type=self.adapter_type).to(self.device)
         self._load_pretrained_weights()
         
         
@@ -226,7 +230,7 @@ class CellposeModel():
         if rescale is not None:
             models_logger.warning("rescaling deprecated in v4.0.1+") 
         if channels is not None:
-            models_logger.warning("channels deprecated in v4.0.1+. If data contain more than 3 channels, only the first 3 channels will be used")
+            models_logger.warning("channels deprecated in v4.0.1+ and ignored; all channels are used by default")
 
         if isinstance(x, list) or x.squeeze().ndim == 5:
             self.timing = []

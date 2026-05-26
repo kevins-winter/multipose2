@@ -57,6 +57,14 @@ def test_shape_2D_5chan_explicit_model():
     y, style = model.net(torch.from_numpy(x).to(model.device))
     assert y.shape == (1, 3, 256, 256), 'network output shape mismatch'
     assert style.shape == (1, 256), 'style shape mismatch'
+
+
+def test_shape_2D_5chan_msca_lite_explicit_model():
+    model = MockCellposeModel(n_keep_layers=2, nchan=5, adapter_type="msca_lite")
+    x = np.zeros((1, 5, 256, 256), dtype=np.float32)
+    y, style = model.net(torch.from_numpy(x).to(model.device))
+    assert y.shape == (1, 3, 256, 256), 'network output shape mismatch'
+    assert style.shape == (1, 256), 'style shape mismatch'
     
 
 #################### 3D Tests ####################

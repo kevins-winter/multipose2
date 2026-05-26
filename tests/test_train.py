@@ -8,6 +8,12 @@ from pathlib import Path
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
+def test_train_channel_guard_rebuilds_adapter():
+    model = models.CellposeModel(gpu=False, nchan=3)
+    train._ensure_net_input_channels(model.net, 5)
+    assert model.net.in_channels == 5
+
+
 def test_class_train(data_dir):
     train_dir = str(data_dir.joinpath('2D').joinpath('train'))
     model_dir = str(data_dir.joinpath('2D').joinpath('train').joinpath('models'))

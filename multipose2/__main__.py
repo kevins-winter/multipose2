@@ -149,7 +149,8 @@ def _train_cellposemodel_cli(args, logger, image_filter, device, pretrained_mode
         load_files = True
 
     # initialize model
-    model = models.CellposeModel(device=device, pretrained_model=pretrained_model)
+    model = models.CellposeModel(device=device, pretrained_model=pretrained_model,
+                                 adapter_type=args.adapter_type)
 
     # train segmentation model
     cpmodel_path = train.train_seg(
@@ -198,7 +199,8 @@ def _evaluate_cellposemodel_cli(args, logger, imf, device, pretrained_model, nor
             ">>>> running multipose2 on %d images using all channels" % nimg)
 
     # handle built-in model exceptions
-    model = models.CellposeModel(device=device, pretrained_model=pretrained_model,)
+    model = models.CellposeModel(device=device, pretrained_model=pretrained_model,
+                                 adapter_type=args.adapter_type)
 
     tqdm_out = utils.TqdmToLogger(logger, level=logging.INFO)
 

@@ -12,6 +12,17 @@ def test_cellpose_multichannel_instantiates():
     model = models.CellposeModel(nchan=8)
 
 
+def test_cellpose_msca_lite_instantiates():
+    from multipose2 import models
+    model = models.CellposeModel(nchan=5, adapter_type="msca_lite")
+
+
+def test_cli_adapter_type_argument():
+    from multipose2.cli import get_arg_parser
+    args = get_arg_parser().parse_args(["--adapter_type", "msca_lite"])
+    assert args.adapter_type == "msca_lite"
+
+
 def test_model_zoo_imports_without_error():
     from multipose2 import models, denoise
     for model_name in models.MODEL_NAMES:
