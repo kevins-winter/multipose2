@@ -1,0 +1,26 @@
+# Colab install:
+# !pip install -r https://raw.githubusercontent.com/kevins-winter/multipose2/multimodal-adapters/notebooks/colab_requirements_multimodal.txt
+
+# Install this feature branch and its package dependencies.
+git+https://github.com/kevins-winter/multipose2.git@multimodal-adapters
+
+# Notebook/runtime utilities used by train_multipose2_multimodal_adapters.ipynb.
+matplotlib
+natsort
+tqdm
+
+# Image IO and segmentation runtime dependencies.
+numpy>=1.23,<2.3
+scipy
+tifffile
+imagecodecs
+opencv-python-headless
+fastremap
+fill-voids
+roifile
+segment_anything
+
+# Colab normally includes CUDA-enabled torch/torchvision already. These are kept
+# unpinned so pip will not force a CPU-only downgrade when a compatible build is present.
+torch
+torchvision
