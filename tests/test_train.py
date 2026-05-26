@@ -3,6 +3,7 @@ from subprocess import check_output, STDOUT
 import os, shutil
 import torch
 from pathlib import Path
+import numpy as np
 
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -12,6 +13,37 @@ def test_train_channel_guard_rebuilds_adapter():
     model = models.CellposeModel(gpu=False, nchan=3)
     train._ensure_net_input_channels(model.net, 5)
     assert model.net.in_channels == 5
+
+
+def test_synthesize_multimodal_training_dir(tmp_path):
+    he_dir = tmp_path / "H&EStain" / "Training"
+    tx_dir = tmp_path / "UnremovedTranscripts" / "Training"
+    out_dir = tmp_path / "Synthesized" / "Training"
+    he_dir.mkdir(parents=True)
+    tx_dir.mkdir(parents=True)
+
+    io.imsave(str(he_dir / "sample_001.tif"),
+              np.zeros((16, 16, 3), dtype=np.float32))
+    io.imsave(str(tx_dir / "sample_001.tif"),
+              np.ones((16, 16, 2), dtype=np.float32))
+    io.imsave(str(he_dir / "sample_001_masks.tif"),
+              np.zeros((16, 16), dtype=np.uint16))
+
+    train_dir = io.synthesize_multimodal_training_dir(
+        modality_dirs={"he": he_dir, "transcripts": tx_dir},
+        output_dir=out_dir,
+        label_dir=he_dir,
+        mask_filter="_masks.tif",
+        modality_channel_axes={"he": -1, "transcripts": -1},
+    )
+
+    images, labels, image_names, *_ = io.load_train_test_data(
+        str(train_dir), mask_filter="_masks.tif"
+    )
+    assert len(images) == 1
+    assert images[0].shape == (16, 16, 5)
+    assert labels[0].shape == (16, 16)
+    assert Path(image_names[0]).parent == out_dir
 
 
 def test_class_train(data_dir):

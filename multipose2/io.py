@@ -383,6 +383,162 @@ def imsave(filename, arr):
         cv2.imwrite(filename, arr)
 
 
+def _is_training_image_file(path, mask_filter, image_extensions):
+    name = path.name
+    if mask_filter and mask_filter in name:
+        return False
+    if "_flows" in name or "_masks" in name or "_seg" in name:
+        return False
+    return path.suffix.lower() in image_extensions
+
+
+def _find_matching_modality_file(directory, sample_id, image_extensions):
+    for ext in image_extensions:
+        candidate = directory / f"{sample_id}{ext}"
+        if candidate.exists():
+            return candidate
+    matches = [
+        p for p in directory.iterdir()
+        if p.stem == sample_id and p.suffix.lower() in image_extensions
+    ]
+    if matches:
+        return sorted(matches)[0]
+    raise FileNotFoundError(f"No image found for sample {sample_id!r} in {directory}")
+
+
+def _find_matching_label_file(directory, sample_id, mask_filter):
+    candidates = []
+    if mask_filter:
+        if "." in mask_filter:
+            candidates.append(directory / f"{sample_id}{mask_filter}")
+        else:
+            candidates.extend([
+                directory / f"{sample_id}{mask_filter}.tif",
+                directory / f"{sample_id}{mask_filter}.tiff",
+                directory / f"{sample_id}{mask_filter}.png",
+                directory / f"{sample_id}{mask_filter}.npy",
+            ])
+    candidates.extend([
+        directory / f"{sample_id}_seg.npy",
+        directory / f"{sample_id}_masks.tif",
+        directory / f"{sample_id}_masks.tiff",
+    ])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"No label found for sample {sample_id!r} in {directory}"
+    )
+
+
+def synthesize_multimodal_training_dir(modality_dirs, output_dir, label_dir=None,
+                                       mask_filter="_seg.npy",
+                                       modality_channel_axes=None,
+                                       image_extensions=(".tif", ".tiff", ".png",
+                                                         ".jpg", ".jpeg"),
+                                       output_suffix=".tif", overwrite=False):
+    """Fuse matched modality folders into a standard Multipose training folder.
+
+    Args:
+        modality_dirs (dict or list): Mapping of modality name to directory, or a
+            list of directories. Files are matched by basename across directories.
+        output_dir (str or Path): Directory where fused images and copied labels
+            are written.
+        label_dir (str or Path, optional): Directory containing labels with the
+            same basename as the primary modality images. Defaults to the first
+            modality directory.
+        mask_filter (str, optional): Label suffix/filter, e.g. ``"_seg.npy"`` or
+            ``"_masks.tif"``. Defaults to ``"_seg.npy"``.
+        modality_channel_axes (dict, optional): Channel axis for each modality.
+            Use ``-1`` for H x W x C, ``0`` for C x H x W, or ``None`` for
+            grayscale H x W.
+        image_extensions (tuple, optional): Input image extensions to consider.
+        output_suffix (str, optional): Extension for fused images. Defaults to
+            ``".tif"``.
+        overwrite (bool, optional): Overwrite existing fused images/labels.
+
+    Returns:
+        Path: The output directory, suitable for ``load_train_test_data``.
+    """
+    if isinstance(modality_dirs, dict):
+        modality_dirs = {name: Path(path) for name, path in modality_dirs.items()}
+    else:
+        modality_dirs = {
+            f"modality_{i}": Path(path) for i, path in enumerate(modality_dirs)
+        }
+    if not modality_dirs:
+        raise ValueError("modality_dirs must contain at least one directory")
+
+    modality_channel_axes = modality_channel_axes or {}
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for name, directory in modality_dirs.items():
+        if not directory.exists():
+            raise FileNotFoundError(
+                f"modality {name!r} directory does not exist: {directory}"
+            )
+
+    primary_name = next(iter(modality_dirs))
+    primary_dir = modality_dirs[primary_name]
+    label_dir = Path(label_dir) if label_dir is not None else primary_dir
+    if not label_dir.exists():
+        raise FileNotFoundError(f"label_dir does not exist: {label_dir}")
+
+    primary_files = natsorted([
+        p for p in primary_dir.iterdir()
+        if _is_training_image_file(p, mask_filter, image_extensions)
+    ])
+    if not primary_files:
+        raise FileNotFoundError(
+            f"No training image files found in primary modality directory: {primary_dir}"
+        )
+
+    fused_files = []
+    for primary_file in tqdm(primary_files, desc="synthesizing multimodal train_dir"):
+        sample_id = primary_file.stem
+        fused_path = output_dir / f"{sample_id}{output_suffix}"
+        label_path = _find_matching_label_file(label_dir, sample_id, mask_filter)
+        out_label_path = output_dir / label_path.name
+
+        if not overwrite and fused_path.exists() and out_label_path.exists():
+            fused_files.append(fused_path)
+            continue
+
+        channel_blocks = []
+        for name, directory in modality_dirs.items():
+            path = (primary_file if name == primary_name else
+                    _find_matching_modality_file(directory, sample_id,
+                                                 image_extensions))
+            img = imread(str(path))
+            img = transforms.convert_image(
+                img,
+                channel_axis=modality_channel_axes.get(name),
+                do_3D=False,
+            )
+            channel_blocks.append(img)
+
+        shapes = {block.shape[:2] for block in channel_blocks}
+        if len(shapes) != 1:
+            raise ValueError(
+                f"Sample {sample_id!r} has mismatched spatial shapes: {sorted(shapes)}"
+            )
+
+        fused = np.concatenate(channel_blocks, axis=-1).astype(np.float32,
+                                                               copy=False)
+        imsave(str(fused_path), fused)
+        if overwrite or not out_label_path.exists():
+            shutil.copyfile(label_path, out_label_path)
+        fused_files.append(fused_path)
+
+    io_logger.info(
+        "synthesized %d multimodal training images into %s",
+        len(fused_files),
+        output_dir,
+    )
+    return output_dir
+
+
 def get_image_files(folder, mask_filter, imf=None, look_one_level_down=False):
     """
     Finds all images in a folder and its subfolders (if specified) with the given file extensions.
