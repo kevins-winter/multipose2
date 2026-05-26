@@ -113,6 +113,38 @@ def test_synthesize_multimodal_training_dir_ignores_secondary_masks(tmp_path):
     assert labels[0].shape == (16, 16)
 
 
+def test_synthesize_multimodal_training_dir_accepts_mask_filter_with_extension(tmp_path):
+    he_dir = tmp_path / "H&EStain" / "Train"
+    tx_dir = tmp_path / "UnremovedTranscripts" / "Train"
+    out_dir = tmp_path / "SynthesizedExtension" / "Train"
+    he_dir.mkdir(parents=True)
+    tx_dir.mkdir(parents=True)
+
+    io.imsave(str(he_dir / "DRG_1_HES_0_500.jpg"),
+              np.zeros((16, 16, 3), dtype=np.uint8))
+    io.imsave(str(tx_dir / "DRG_1_SegTrans_0_500.jpg"),
+              np.ones((16, 16, 1), dtype=np.uint8))
+    io.imsave(str(he_dir / "DRG_1_HES_0_500_masks.png"),
+              np.zeros((16, 16), dtype=np.uint8))
+
+    train_dir = io.synthesize_multimodal_training_dir(
+        modality_dirs={"he": he_dir, "transcripts": tx_dir},
+        output_dir=out_dir,
+        label_dir=he_dir,
+        mask_filter="_masks.png",
+        modality_channel_axes={"he": -1, "transcripts": -1},
+        sample_id_regex=r"(DRG_\d+)_.*_(\d+_\d+)",
+    )
+
+    images, labels, image_names, *_ = io.load_train_test_data(
+        str(train_dir), mask_filter="_masks.png"
+    )
+    assert len(images) == 1
+    assert images[0].shape == (16, 16, 4)
+    assert labels[0].shape == (16, 16)
+    assert Path(image_names[0]).with_suffix("").name == "DRG_1_0_500"
+
+
 def test_class_train(data_dir):
     train_dir = str(data_dir.joinpath('2D').joinpath('train'))
     model_dir = str(data_dir.joinpath('2D').joinpath('train').joinpath('models'))

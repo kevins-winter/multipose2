@@ -493,6 +493,12 @@ def _find_matching_label_file(directory, sample_id, mask_filter, sample_id_regex
     )
 
 
+def _synthesized_label_name(sample_id, label_path, mask_filter):
+    if mask_filter == "_seg.npy" or "." in mask_filter:
+        return f"{sample_id}{mask_filter}"
+    return f"{sample_id}{mask_filter}{label_path.suffix}"
+
+
 def synthesize_multimodal_training_dir(modality_dirs, output_dir, label_dir=None,
                                        mask_filter="_seg.npy",
                                        modality_channel_axes=None,
@@ -568,7 +574,9 @@ def synthesize_multimodal_training_dir(modality_dirs, output_dir, label_dir=None
         label_path = _find_matching_label_file(
             label_dir, sample_id, mask_filter, sample_id_regex=sample_id_regex
         )
-        out_label_path = output_dir / f"{sample_id}{mask_filter}"
+        out_label_path = output_dir / _synthesized_label_name(
+            sample_id, label_path, mask_filter
+        )
 
         if not overwrite and fused_path.exists() and out_label_path.exists():
             fused_files.append(fused_path)
@@ -711,7 +719,7 @@ def get_label_files(image_names, mask_filter, imf=None):
         flow_names = None
 
     # check for masks
-    if mask_filter == "_seg.npy":
+    if mask_filter == "_seg.npy" or "." in mask_filter:
         label_names = [label_names[n] + mask_filter for n in range(nimg)]
         return label_names, None
 
