@@ -448,7 +448,11 @@ def _find_matching_modality_file(directory, sample_id, image_extensions,
         return sorted(matches)[0]
     if sample_id_regex is not None:
         indexed = _index_files_by_sample_id(
-            [p for p in directory.iterdir() if p.suffix.lower() in image_extensions],
+            [
+                p for p in directory.iterdir()
+                if _is_training_image_file(p, mask_filter=None,
+                                           image_extensions=image_extensions)
+            ],
             sample_id_regex=sample_id_regex,
         )
         return _unique_index_match(indexed, sample_id, directory, "image")
