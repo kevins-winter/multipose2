@@ -200,6 +200,72 @@ def set_trainable_parameters(net, trainable_mode="all", n_trainable_blocks=2):
         trainable_mode, n_trainable_blocks, trainable, total,
     )
 
+
+def _learning_rate_schedule(n_epochs, learning_rate, warmup_epochs=10,
+                            decay_schedule=True):
+    """Build the per-epoch learning-rate schedule used by segmentation training."""
+    n_epochs = int(n_epochs)
+    warmup_epochs = int(warmup_epochs)
+    if n_epochs < 1:
+        raise ValueError("n_epochs must be >= 1")
+    if warmup_epochs < 0:
+        raise ValueError("warmup_epochs must be >= 0")
+    warmup_epochs = min(warmup_epochs, n_epochs)
+    if warmup_epochs > 0:
+        LR = np.linspace(0, learning_rate, warmup_epochs)
+        LR = np.append(LR, learning_rate * np.ones(max(0, n_epochs - warmup_epochs)))
+    else:
+        LR = learning_rate * np.ones(n_epochs)
+    if decay_schedule and n_epochs > 300:
+        LR = LR[:-100]
+        for i in range(10):
+            LR = np.append(LR, LR[-1] / 2 * np.ones(10))
+    elif decay_schedule and n_epochs > 99:
+        LR = LR[:-50]
+        for i in range(10):
+            LR = np.append(LR, LR[-1] / 2 * np.ones(5))
+    return LR
+
+
+def _normalize_training_stages(training_stages, n_epochs, learning_rate,
+                               trainable_mode, n_trainable_blocks,
+                               warmup_epochs):
+    """Return a validated list of training stage dictionaries."""
+    if training_stages is None:
+        return [{
+            "name": "all" if trainable_mode == "all" else trainable_mode,
+            "trainable_mode": trainable_mode,
+            "n_epochs": n_epochs,
+            "learning_rate": learning_rate,
+            "n_trainable_blocks": n_trainable_blocks,
+            "warmup_epochs": warmup_epochs,
+            "decay_schedule": True,
+        }]
+    if len(training_stages) == 0:
+        raise ValueError("training_stages must contain at least one stage")
+
+    stages = []
+    for i, stage in enumerate(training_stages, start=1):
+        if "n_epochs" not in stage:
+            raise ValueError(f"training stage {i} is missing 'n_epochs'")
+        if "learning_rate" not in stage:
+            raise ValueError(f"training stage {i} is missing 'learning_rate'")
+        stage_epochs = int(stage["n_epochs"])
+        if stage_epochs < 1:
+            raise ValueError(f"training stage {i} has n_epochs < 1")
+        stage_warmup = int(stage.get("warmup_epochs", min(2, stage_epochs)))
+        stages.append({
+            "name": stage.get("name", f"stage{i}"),
+            "trainable_mode": stage.get("trainable_mode", trainable_mode),
+            "n_epochs": stage_epochs,
+            "learning_rate": stage["learning_rate"],
+            "n_trainable_blocks": stage.get("n_trainable_blocks", n_trainable_blocks),
+            "warmup_epochs": stage_warmup,
+            "decay_schedule": stage.get("decay_schedule", False),
+        })
+    return stages
+
+
 def _reshape_norm_save(files, channels=None, channel_axis=None,
                        normalize_params={"normalize": False}):
     """ not currently used -- normalization happening on each batch if not load_files """
@@ -402,7 +468,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
               min_train_masks=5, model_name=None, class_weights=None,
-              trainable_mode="all", n_trainable_blocks=2):
+              trainable_mode="all", n_trainable_blocks=2, warmup_epochs=10,
+              training_stages=None):
     """
     Train the network with images for segmentation.
 
@@ -436,6 +503,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         model_name (str, optional): String - name of the network. Defaults to None.
         trainable_mode (str, optional): Which parameters to optimize. Use "all" for full fine-tuning, "adapter_head" for the input adapter and output head, "adapter_head_last_blocks" for the input adapter, output head, encoder neck, and the final SAM encoder blocks, "adapter_only" for only the input adapter, or "head_only" for only the output head. Defaults to "all".
         n_trainable_blocks (int, optional): Number of final SAM encoder blocks to train when trainable_mode="adapter_head_last_blocks". Defaults to 2.
+        warmup_epochs (int, optional): Number of epochs used to ramp the learning rate from 0 to learning_rate for non-staged training. Defaults to 10.
+        training_stages (list of dict, optional): Continuous staged training schedule. Each stage can define "name", "trainable_mode", "n_epochs", "learning_rate", "n_trainable_blocks", "warmup_epochs", and "decay_schedule". Preprocessing runs once, then optimizer/trainable parameters are rebuilt at stage boundaries.
 
     Returns:
         tuple: A tuple containing the path to the saved model weights, training losses, and test losses.
@@ -482,9 +551,9 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
     input_nchan = _infer_nchan(train_data, train_files, channel_axis=channel_axis)
     _ensure_net_input_channels(net, input_nchan)
-    set_trainable_parameters(
-        net, trainable_mode=trainable_mode,
-        n_trainable_blocks=n_trainable_blocks,
+    stages = _normalize_training_stages(
+        training_stages, n_epochs, learning_rate, trainable_mode,
+        n_trainable_blocks, warmup_epochs,
     )
     
     net.diam_labels.data = torch.Tensor([diam_train.mean()]).to(device)
@@ -499,27 +568,17 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     nimg_per_epoch = nimg if nimg_per_epoch is None else nimg_per_epoch
     nimg_test_per_epoch = nimg_test if nimg_test_per_epoch is None else nimg_test_per_epoch
 
-    # learning rate schedule
-    LR = np.linspace(0, learning_rate, 10)
-    LR = np.append(LR, learning_rate * np.ones(max(0, n_epochs - 10)))
-    if n_epochs > 300:
-        LR = LR[:-100]
-        for i in range(10):
-            LR = np.append(LR, LR[-1] / 2 * np.ones(10))
-    elif n_epochs > 99:
-        LR = LR[:-50]
-        for i in range(10):
-            LR = np.append(LR, LR[-1] / 2 * np.ones(5))
-
-    train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}")
-    train_logger.info(
-        f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}"
-    )
-    trainable_params = [p for p in net.parameters() if p.requires_grad]
-    if len(trainable_params) == 0:
-        raise ValueError(f"trainable_mode={trainable_mode!r} selected no parameters")
-    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate,
-                                    weight_decay=weight_decay)
+    total_epochs = sum(stage["n_epochs"] for stage in stages)
+    train_logger.info(f">>> n_epochs={total_epochs}, n_train={nimg}, n_test={nimg_test}")
+    if len(stages) == 1:
+        train_logger.info(
+            f">>> AdamW, learning_rate={stages[0]['learning_rate']:0.5f}, weight_decay={weight_decay:0.5f}"
+        )
+    else:
+        train_logger.info(
+            ">>> AdamW staged training, %d stages, weight_decay=%0.5f",
+            len(stages), weight_decay,
+        )
 
     t0 = time.time()
     model_name = f"cellpose_{t0}" if model_name is None else model_name
@@ -530,105 +589,132 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     train_logger.info(f">>> saving model to {filename}")
 
     lavg, nsum = 0, 0
-    train_losses, test_losses = np.zeros(n_epochs), np.zeros(n_epochs)
-    for iepoch in range(n_epochs):
-        np.random.seed(iepoch)
-        if nimg != nimg_per_epoch:
-            # choose random images for epoch with probability train_probs
-            rperm = np.random.choice(np.arange(0, nimg), size=(nimg_per_epoch,),
-                                     p=train_probs)
-        else:
-            # otherwise use all images
-            rperm = np.random.permutation(np.arange(0, nimg))
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = LR[iepoch] # set learning rate
-        net.train()
-        for k in range(0, nimg_per_epoch, batch_size):
-            kend = min(k + batch_size, nimg_per_epoch)
-            inds = rperm[k:kend]
-            imgs, lbls = _get_batch(inds, data=train_data, labels=train_labels,
-                                    files=train_files, labels_files=train_labels_files,
-                                    **kwargs)
-            diams = np.array([diam_train[i] for i in inds])
-            rsc = diams / net.diam_mean.item() if rescale else np.ones(
-                len(diams), "float32")
-            # augmentations
-            imgi, lbl = random_rotate_and_resize(imgs, Y=lbls, rescale=rsc,
-                                                            scale_range=scale_range,
-                                                            xy=(bsize, bsize))[:2]
-            # network and loss optimization
-            X = torch.from_numpy(imgi).to(device)
-            lbl = torch.from_numpy(lbl).to(device)
-
-            with torch.autocast(device_type=device.type, dtype=net.dtype):
-                y = net(X)[0]
-            loss = _loss_fn_seg(lbl, y, device)
-            if y.shape[1] > 3:
-                loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                loss += loss3
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            train_loss = loss.item()
-            train_loss *= len(imgi)
-
-            # keep track of average training loss across epochs
-            lavg += train_loss
-            nsum += len(imgi)
-            # per epoch training loss
-            train_losses[iepoch] += train_loss
-        train_losses[iepoch] /= nimg_per_epoch
-
-        if iepoch == 5 or iepoch % 10 == 0:
-            lavgt = 0.
-            if test_data is not None or test_files is not None:
-                np.random.seed(42)
-                if nimg_test != nimg_test_per_epoch:
-                    rperm = np.random.choice(np.arange(0, nimg_test),
-                                             size=(nimg_test_per_epoch,), p=test_probs)
-                else:
-                    rperm = np.random.permutation(np.arange(0, nimg_test))
-                for ibatch in range(0, len(rperm), batch_size):
-                    with torch.no_grad():
-                        net.eval()
-                        inds = rperm[ibatch:ibatch + batch_size]
-                        imgs, lbls = _get_batch(inds, data=test_data,
-                                                labels=test_labels, files=test_files,
-                                                labels_files=test_labels_files,
-                                                **kwargs)
-                        diams = np.array([diam_test[i] for i in inds])
-                        rsc = diams / net.diam_mean.item() if rescale else np.ones(
-                            len(diams), "float32")
-                        imgi, lbl = random_rotate_and_resize(
-                            imgs, Y=lbls, rescale=rsc, scale_range=scale_range,
-                            xy=(bsize, bsize))[:2]
-                        X = torch.from_numpy(imgi).to(device)
-                        lbl = torch.from_numpy(lbl).to(device)
-
-                        with torch.autocast(device_type=device.type, dtype=net.dtype):
-                            y = net(X)[0]
-                        loss = _loss_fn_seg(lbl, y, device)
-                        if y.shape[1] > 3:
-                            loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                            loss += loss3            
-                        test_loss = loss.item()
-                        test_loss *= len(imgi)
-                        lavgt += test_loss
-                lavgt /= len(rperm)
-                test_losses[iepoch] = lavgt
-            lavg /= nsum
-            train_logger.info(
-                f"{iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s"
+    train_losses, test_losses = np.zeros(total_epochs), np.zeros(total_epochs)
+    global_epoch = 0
+    for istage, stage in enumerate(stages, start=1):
+        lavg, nsum = 0, 0
+        train_logger.info(
+            ">>> stage %d/%d %s: trainable_mode=%s, n_epochs=%d, learning_rate=%0.6g, warmup_epochs=%d",
+            istage, len(stages), stage["name"], stage["trainable_mode"],
+            stage["n_epochs"], stage["learning_rate"], stage["warmup_epochs"],
+        )
+        set_trainable_parameters(
+            net, trainable_mode=stage["trainable_mode"],
+            n_trainable_blocks=stage["n_trainable_blocks"],
+        )
+        trainable_params = [p for p in net.parameters() if p.requires_grad]
+        if len(trainable_params) == 0:
+            raise ValueError(
+                f"trainable_mode={stage['trainable_mode']!r} selected no parameters"
             )
-            lavg, nsum = 0, 0
-
-        if iepoch == n_epochs - 1 or (iepoch % save_every == 0 and iepoch != 0):
-            if save_each and iepoch != n_epochs - 1:  #separate files as model progresses
-                filename0 = str(filename) + f"_epoch_{iepoch:04d}"
+        optimizer = torch.optim.AdamW(trainable_params, lr=stage["learning_rate"],
+                                      weight_decay=weight_decay)
+        LR = _learning_rate_schedule(
+            stage["n_epochs"], stage["learning_rate"],
+            warmup_epochs=stage["warmup_epochs"],
+            decay_schedule=stage["decay_schedule"],
+        )
+        for stage_epoch in range(stage["n_epochs"]):
+            iepoch = global_epoch
+            np.random.seed(iepoch)
+            if nimg != nimg_per_epoch:
+                # choose random images for epoch with probability train_probs
+                rperm = np.random.choice(np.arange(0, nimg), size=(nimg_per_epoch,),
+                                         p=train_probs)
             else:
-                filename0 = filename
-            train_logger.info(f"saving network parameters to {filename0}")
-            net.save_model(filename0)
+                # otherwise use all images
+                rperm = np.random.permutation(np.arange(0, nimg))
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = LR[stage_epoch] # set learning rate
+            net.train()
+            for k in range(0, nimg_per_epoch, batch_size):
+                kend = min(k + batch_size, nimg_per_epoch)
+                inds = rperm[k:kend]
+                imgs, lbls = _get_batch(inds, data=train_data, labels=train_labels,
+                                        files=train_files, labels_files=train_labels_files,
+                                        **kwargs)
+                diams = np.array([diam_train[i] for i in inds])
+                rsc = diams / net.diam_mean.item() if rescale else np.ones(
+                    len(diams), "float32")
+                # augmentations
+                imgi, lbl = random_rotate_and_resize(imgs, Y=lbls, rescale=rsc,
+                                                                scale_range=scale_range,
+                                                                xy=(bsize, bsize))[:2]
+                # network and loss optimization
+                X = torch.from_numpy(imgi).to(device)
+                lbl = torch.from_numpy(lbl).to(device)
+
+                with torch.autocast(device_type=device.type, dtype=net.dtype):
+                    y = net(X)[0]
+                loss = _loss_fn_seg(lbl, y, device)
+                if y.shape[1] > 3:
+                    loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
+                    loss += loss3
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                train_loss = loss.item()
+                train_loss *= len(imgi)
+
+                # keep track of average training loss across epochs
+                lavg += train_loss
+                nsum += len(imgi)
+                # per epoch training loss
+                train_losses[iepoch] += train_loss
+            train_losses[iepoch] /= nimg_per_epoch
+
+            should_log = iepoch == 5 or iepoch % 10 == 0 or stage_epoch == 0
+            if should_log:
+                lavgt = 0.
+                if test_data is not None or test_files is not None:
+                    np.random.seed(42)
+                    if nimg_test != nimg_test_per_epoch:
+                        rperm = np.random.choice(np.arange(0, nimg_test),
+                                                 size=(nimg_test_per_epoch,), p=test_probs)
+                    else:
+                        rperm = np.random.permutation(np.arange(0, nimg_test))
+                    for ibatch in range(0, len(rperm), batch_size):
+                        with torch.no_grad():
+                            net.eval()
+                            inds = rperm[ibatch:ibatch + batch_size]
+                            imgs, lbls = _get_batch(inds, data=test_data,
+                                                    labels=test_labels, files=test_files,
+                                                    labels_files=test_labels_files,
+                                                    **kwargs)
+                            diams = np.array([diam_test[i] for i in inds])
+                            rsc = diams / net.diam_mean.item() if rescale else np.ones(
+                                len(diams), "float32")
+                            imgi, lbl = random_rotate_and_resize(
+                                imgs, Y=lbls, rescale=rsc, scale_range=scale_range,
+                                xy=(bsize, bsize))[:2]
+                            X = torch.from_numpy(imgi).to(device)
+                            lbl = torch.from_numpy(lbl).to(device)
+
+                            with torch.autocast(device_type=device.type, dtype=net.dtype):
+                                y = net(X)[0]
+                            loss = _loss_fn_seg(lbl, y, device)
+                            if y.shape[1] > 3:
+                                loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
+                                loss += loss3
+                            test_loss = loss.item()
+                            test_loss *= len(imgi)
+                            lavgt += test_loss
+                    lavgt /= len(rperm)
+                    test_losses[iepoch] = lavgt
+                lavg /= nsum
+                train_logger.info(
+                    f"{iepoch}, stage={stage['name']}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[stage_epoch]:.6f}, time {time.time()-t0:.2f}s"
+                )
+                lavg, nsum = 0, 0
+
+            if iepoch == total_epochs - 1 or (iepoch % save_every == 0 and iepoch != 0):
+                if save_each and iepoch != total_epochs - 1:  #separate files as model progresses
+                    filename0 = str(filename) + f"_epoch_{iepoch:04d}"
+                else:
+                    filename0 = filename
+                train_logger.info(f"saving network parameters to {filename0}")
+                net.save_model(filename0)
+            global_epoch += 1
     
     net.save_model(filename)
     if original_net_dtype != torch.float32:
@@ -636,3 +722,13 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         net.dtype = original_net_dtype
 
     return filename, train_losses, test_losses
+
+
+def train_seg_staged(net, training_stages, **kwargs):
+    """Train segmentation model with a continuous staged schedule.
+
+    This is a convenience wrapper around train_seg(..., training_stages=...).
+    Data preprocessing, flow generation, normalization, and channel checks run once;
+    trainable parameters and the optimizer are rebuilt at each stage boundary.
+    """
+    return train_seg(net, training_stages=training_stages, **kwargs)

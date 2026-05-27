@@ -68,6 +68,32 @@ def test_set_trainable_parameters_adapter_head_last_blocks():
     )
 
 
+def test_learning_rate_schedule_short_stage_warmup():
+    lr = train._learning_rate_schedule(
+        n_epochs=5, learning_rate=1e-4, warmup_epochs=2,
+        decay_schedule=False,
+    )
+    np.testing.assert_allclose(lr, [0, 1e-4, 1e-4, 1e-4, 1e-4])
+
+
+def test_normalize_training_stages_defaults_to_short_warmup():
+    stages = train._normalize_training_stages(
+        [{"name": "tail", "trainable_mode": "adapter_head_last_blocks",
+          "n_epochs": 10, "learning_rate": 5e-6}],
+        n_epochs=100, learning_rate=1e-5, trainable_mode="all",
+        n_trainable_blocks=2, warmup_epochs=10,
+    )
+    assert stages == [{
+        "name": "tail",
+        "trainable_mode": "adapter_head_last_blocks",
+        "n_epochs": 10,
+        "learning_rate": 5e-6,
+        "n_trainable_blocks": 2,
+        "warmup_epochs": 2,
+        "decay_schedule": False,
+    }]
+
+
 def test_synthesize_multimodal_training_dir(tmp_path):
     he_dir = tmp_path / "H&EStain" / "Training"
     tx_dir = tmp_path / "UnremovedTranscripts" / "Training"

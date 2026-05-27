@@ -16,6 +16,27 @@ except:
 r_tol, a_tol = 1e-2, 1e-2
 
 
+def test_average_precision_empty_true_empty_pred_is_one():
+    masks_true = np.zeros((16, 16), dtype=np.uint16)
+    masks_pred = np.zeros((16, 16), dtype=np.uint16)
+    ap, tp, fp, fn = metrics.average_precision(masks_true, masks_pred)
+    np.testing.assert_allclose(ap, [1.0, 1.0, 1.0])
+    np.testing.assert_allclose(tp, [0.0, 0.0, 0.0])
+    np.testing.assert_allclose(fp, [0.0, 0.0, 0.0])
+    np.testing.assert_allclose(fn, [0.0, 0.0, 0.0])
+
+
+def test_average_precision_empty_true_with_pred_is_zero():
+    masks_true = np.zeros((16, 16), dtype=np.uint16)
+    masks_pred = np.zeros((16, 16), dtype=np.uint16)
+    masks_pred[2:6, 2:6] = 1
+    ap, tp, fp, fn = metrics.average_precision(masks_true, masks_pred)
+    np.testing.assert_allclose(ap, [0.0, 0.0, 0.0])
+    np.testing.assert_allclose(tp, [0.0, 0.0, 0.0])
+    np.testing.assert_allclose(fp, [1.0, 1.0, 1.0])
+    np.testing.assert_allclose(fn, [0.0, 0.0, 0.0])
+
+
 def clear_output(data_dir, image_names):
     data_dir_2D = data_dir.joinpath("2D")
     data_dir_3D = data_dir.joinpath("2D")
