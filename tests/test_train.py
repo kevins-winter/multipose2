@@ -1,4 +1,4 @@
-from multipose2 import io, models, train
+from multipose2 import io, models, train, vit_sam
 from subprocess import check_output, STDOUT
 import os, shutil
 import torch
@@ -271,3 +271,26 @@ def test_cli_make_train(data_dir):
     assert 30 == len(files)
 
     shutil.rmtree((data_dir / '3D/train'))
+
+
+def test_never_trainable_params_stay_frozen_in_every_mode():
+    net = vit_sam.Transformer(in_channels=5, bsize=64)
+    params = dict(net.named_parameters())
+    for name in train.NEVER_TRAINABLE_PARAMS:
+        assert name in params, f"{name} is not a parameter of Transformer"
+    for mode in ("all", "adapter_head", "adapter_head_last_blocks",
+                 "adapter_only", "head_only"):
+        train.set_trainable_parameters(net, trainable_mode=mode)
+        for name in train.NEVER_TRAINABLE_PARAMS:
+            assert not params[name].requires_grad, (
+                f"{name} became trainable in trainable_mode={mode!r}"
+            )
+
+
+def test_trainable_mode_all_still_trains_encoder_and_adapter():
+    net = vit_sam.Transformer(in_channels=5, bsize=64)
+    train.set_trainable_parameters(net, trainable_mode="all")
+    assert net.encoder.blocks[0].attn.qkv.weight.requires_grad
+    assert net.encoder.pos_embed.requires_grad
+    assert net.input_adapter.proj.weight.requires_grad
+    assert net.out.weight.requires_grad

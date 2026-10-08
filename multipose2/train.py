@@ -12,6 +12,9 @@ import logging
 
 train_logger = logging.getLogger(__name__)
 
+# parameter names that are frozen by the architecture, never optimized
+NEVER_TRAINABLE_PARAMS = frozenset({"W2", "diam_mean", "diam_labels"})
+
 def _loss_fn_class(lbl, y, class_weights=None):
     """
     Calculates the loss function between true labels lbl and prediction y.
@@ -158,6 +161,17 @@ def _last_encoder_block_prefixes(net, n_trainable_blocks):
     return [f"encoder.blocks.{i}." for i in range(start, n_blocks)]
 
 
+def _is_never_trainable(name):
+    """Parameters the architecture declares with requires_grad=False.
+
+    W2 is a fixed identity basis for the token-to-pixel readout, and the diameter
+    values are stored metadata rather than learned weights. Optimizing any of them
+    (and applying weight decay to them) corrupts the model, so no trainable_mode
+    may select them.
+    """
+    return name.rsplit(".", 1)[-1] in NEVER_TRAINABLE_PARAMS
+
+
 def set_trainable_parameters(net, trainable_mode="all", n_trainable_blocks=2):
     """Select which network parameters are optimized during segmentation training."""
     valid_modes = {
@@ -170,8 +184,9 @@ def set_trainable_parameters(net, trainable_mode="all", n_trainable_blocks=2):
         )
     if n_trainable_blocks < 0:
         raise ValueError("n_trainable_blocks must be >= 0")
-    for param in net.parameters():
-        param.requires_grad = trainable_mode == "all"
+    for name, param in net.named_parameters():
+        param.requires_grad = (trainable_mode == "all" and
+                               not _is_never_trainable(name))
     if trainable_mode == "all":
         trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
         total = sum(p.numel() for p in net.parameters())
@@ -191,7 +206,8 @@ def set_trainable_parameters(net, trainable_mode="all", n_trainable_blocks=2):
         prefixes.append("encoder.neck.")
 
     for name, param in net.named_parameters():
-        param.requires_grad = any(name.startswith(prefix) for prefix in prefixes)
+        param.requires_grad = (any(name.startswith(prefix) for prefix in prefixes)
+                               and not _is_never_trainable(name))
 
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     total = sum(p.numel() for p in net.parameters())
