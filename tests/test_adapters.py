@@ -45,3 +45,38 @@ def test_multichannel_checkpoint_loads_with_matching_and_mismatched_nchan(tmp_pa
     mismatched = MockTransformer(1, in_channels=8, adapter_type="linear")
     mismatched.load_model(path, device=mismatched.device)
     assert mismatched.in_channels == 8
+
+
+def _reference_forward(net, x):
+    """Inline copy of the pre-split forward pass, kept as a regression reference."""
+    x = net.input_adapter(x)
+    x = net.encoder.patch_embed(x)
+    if net.encoder.pos_embed is not None:
+        x = x + net.encoder.pos_embed
+    for blk in net.encoder.blocks:
+        x = blk(x)
+    x = net.encoder.neck(x.permute(0, 3, 1, 2))
+    x1 = net.out(x)
+    x1 = torch.nn.functional.conv_transpose2d(x1, net.W2, stride=net.ps, padding=0)
+    return x1, torch.zeros((x.shape[0], 256), device=x.device)
+
+
+def test_forward_matches_pre_split_reference():
+    net = vit_sam.Transformer(in_channels=3, bsize=64)
+    net.eval()
+    x = torch.randn(1, 3, 64, 64)
+    with torch.no_grad():
+        got, got_style = net(x)
+        want, want_style = _reference_forward(net, x)
+    assert torch.equal(got, want)
+    assert got_style.shape == want_style.shape
+
+
+def test_trunk_head_split_composes_to_forward():
+    net = vit_sam.Transformer(in_channels=5, bsize=64)
+    net.eval()
+    x = torch.randn(2, 5, 64, 64)
+    with torch.no_grad():
+        feat = net.forward_trunk(net.input_adapter(x))
+        assert feat.shape == (2, 256, 8, 8)
+        assert torch.equal(net.forward_head(feat), net(x)[0])

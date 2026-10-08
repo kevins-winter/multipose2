@@ -147,35 +147,58 @@ class Transformer(nn.Module):
         self._adapter_in_channels = self._adapter_in_channels.to(device)
         self._adapter_type_id = self._adapter_type_id.to(device)
 
-    def forward(self, x):      
+    def forward_trunk(self, x):
+        """Run the SAM encoder on 3-channel input and return neck features.
+
+        Separated from forward() so the encoder can be run on its own, e.g. under
+        no_grad with frozen weights, or once per input to cache its features.
+
+        Args:
+            x (torch.Tensor): image batch of size [N x 3 x Ly x Lx].
+
+        Returns:
+            torch.Tensor: neck features of size [N x 256 x Ly//ps x Lx//ps].
+        """
         # same progression as SAM until readout
-        x = self.input_adapter(x)
         x = self.encoder.patch_embed(x)
-        
+
         if self.encoder.pos_embed is not None:
             x = x + self.encoder.pos_embed
-        
+
         if self.training and self.rdrop > 0:
             nlay = len(self.encoder.blocks)
-            rdrop = (torch.rand((len(x), nlay), device=x.device) < 
+            rdrop = (torch.rand((len(x), nlay), device=x.device) <
                      torch.linspace(0, self.rdrop, nlay, device=x.device)).to(x.dtype)
-            for i, blk in enumerate(self.encoder.blocks):            
+            for i, blk in enumerate(self.encoder.blocks):
                 mask = rdrop[:,i].unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
                 x = x * mask + blk(x) * (1-mask)
         else:
             for blk in self.encoder.blocks:
                 x = blk(x)
 
-        x = self.encoder.neck(x.permute(0, 3, 1, 2))
+        return self.encoder.neck(x.permute(0, 3, 1, 2))
 
+    def forward_head(self, feat):
+        """Map neck features to flow outputs.
+
+        Args:
+            feat (torch.Tensor): neck features of size [N x 256 x h x w].
+
+        Returns:
+            torch.Tensor: flow outputs of size [N x nout x h*ps x w*ps].
+        """
         # readout is changed here
-        x1 = self.out(x)
-        x1 = F.conv_transpose2d(x1, self.W2, stride = self.ps, padding = 0)
-        
+        x1 = self.out(feat)
+        return F.conv_transpose2d(x1, self.W2, stride = self.ps, padding = 0)
+
+    def forward(self, x):
+        feat = self.forward_trunk(self.input_adapter(x))
+        x1 = self.forward_head(feat)
+
         # maintain the second output of feature size 256 for backwards compatibility
-           
-        return x1, torch.zeros((x.shape[0], 256), device=x.device)
-    
+
+        return x1, torch.zeros((feat.shape[0], 256), device=feat.device)
+
     def load_model(self, PATH, device, strict = False):
         state_dict = torch.load(PATH, map_location = device, weights_only=True)
         keys = [k for k in state_dict.keys()]
