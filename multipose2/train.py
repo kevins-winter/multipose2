@@ -282,6 +282,94 @@ def _normalize_training_stages(training_stages, n_epochs, learning_rate,
     return stages
 
 
+def _stage_fingerprint(stages):
+    """Identity of a training schedule, so a resume cannot silently change it."""
+    return [
+        (s["name"], s["trainable_mode"], int(s["n_epochs"]),
+         float(s["learning_rate"]), int(s["n_trainable_blocks"]),
+         int(s["warmup_epochs"]), bool(s["decay_schedule"]))
+        for s in stages
+    ]
+
+
+def _save_resume_checkpoint(path, net, optimizer, istage, stage_epoch, global_epoch,
+                            train_losses, test_losses, stages):
+    """Write a checkpoint that training can be resumed from.
+
+    ``stage_epoch`` and ``global_epoch`` are the epochs that just *completed*.
+    The write goes to a temporary file and is then renamed, so a run killed
+    mid-write (a Colab disconnect, say) cannot leave a corrupt checkpoint.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "format": 1,
+        "model_state": net.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "istage": int(istage),
+        "stage_epoch": int(stage_epoch),
+        "global_epoch": int(global_epoch),
+        "train_losses": np.asarray(train_losses),
+        "test_losses": np.asarray(test_losses),
+        "stages": _stage_fingerprint(stages),
+        "in_channels": getattr(net, "in_channels", None),
+        "adapter_type": getattr(net, "adapter_type", None),
+        # numpy is re-seeded per epoch, so only torch's generator needs saving
+        "torch_rng_state": torch.get_rng_state().cpu(),
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+    train_logger.info(
+        "saved resume checkpoint to %s (stage %d, epoch %d)", path, istage,
+        global_epoch,
+    )
+
+
+def _load_resume_checkpoint(path, net, stages, total_epochs):
+    """Restore model weights and schedule position, or return None if absent."""
+    path = Path(path)
+    if not path.exists():
+        train_logger.info(">>> no resume checkpoint at %s, starting from scratch", path)
+        return None
+    state = torch.load(path, map_location=net.device, weights_only=False)
+    if state.get("stages") != _stage_fingerprint(stages):
+        raise ValueError(
+            f"resume checkpoint {path} was written for a different training schedule; "
+            "restore the original stages, or pass resume=False to start over"
+        )
+    for key in ("in_channels", "adapter_type"):
+        want, got = getattr(net, key, None), state.get(key)
+        if got is not None and want != got:
+            raise ValueError(
+                f"resume checkpoint {path} has {key}={got!r} but this model has {want!r}"
+            )
+    net.load_state_dict(state["model_state"])
+    try:
+        torch.set_rng_state(state["torch_rng_state"].cpu())
+    except Exception as exc:  # non-fatal: only affects stochastic-depth draws
+        train_logger.warning("could not restore torch RNG state (%s)", exc)
+    train_losses = np.asarray(state["train_losses"], dtype="float64")
+    test_losses = np.asarray(state["test_losses"], dtype="float64")
+    if len(train_losses) != total_epochs or len(test_losses) != total_epochs:
+        raise ValueError(
+            f"resume checkpoint {path} has loss history of length "
+            f"{len(train_losses)}, but this schedule has {total_epochs} epochs"
+        )
+    train_logger.info(
+        ">>> resuming from %s: stage %d, %d epochs already completed",
+        path, state["istage"], state["global_epoch"] + 1,
+    )
+    return {
+        "istage": int(state["istage"]),
+        "stage_epoch": int(state["stage_epoch"]) + 1,
+        "global_epoch": int(state["global_epoch"]) + 1,
+        "optimizer_state": state["optimizer_state"],
+        "train_losses": train_losses,
+        "test_losses": test_losses,
+    }
+
+
 def _reshape_norm_save(files, channels=None, channel_axis=None,
                        normalize_params={"normalize": False}):
     """ not currently used -- normalization happening on each batch if not load_files """
@@ -485,7 +573,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               nimg_test_per_epoch=None, rescale=False, scale_range=None, bsize=256,
               min_train_masks=5, model_name=None, class_weights=None,
               trainable_mode="all", n_trainable_blocks=2, warmup_epochs=10,
-              training_stages=None):
+              training_stages=None, resume=False, resume_every=0,
+              resume_path=None):
     """
     Train the network with images for segmentation.
 
@@ -521,6 +610,9 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         n_trainable_blocks (int, optional): Number of final SAM encoder blocks to train when trainable_mode="adapter_head_last_blocks". Defaults to 2.
         warmup_epochs (int, optional): Number of epochs used to ramp the learning rate from 0 to learning_rate for non-staged training. Defaults to 10.
         training_stages (list of dict, optional): Continuous staged training schedule. Each stage can define "name", "trainable_mode", "n_epochs", "learning_rate", "n_trainable_blocks", "warmup_epochs", and "decay_schedule". Preprocessing runs once, then optimizer/trainable parameters are rebuilt at stage boundaries.
+        resume (bool, optional): Load the checkpoint at resume_path, if it exists, and continue from the epoch after the one it recorded. Raises if the checkpoint was written for a different schedule or a differently shaped model. Defaults to False.
+        resume_every (int, optional): Write a resume checkpoint every N epochs within each stage, and always at the end of a stage. 0 disables resume checkpointing. The checkpoint holds the full model and optimizer state, so it is roughly the model size plus two floats per trainable parameter; prefer local disk over a network drive. Defaults to 0.
+        resume_path (str or Path, optional): Where the resume checkpoint is written and read. Defaults to save_path/models/<model_name>_resume.pt. Note that data preprocessing and flow computation are not cached, so they re-run on resume.
 
     Returns:
         tuple: A tuple containing the path to the saved model weights, training losses, and test losses.
@@ -607,7 +699,32 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     lavg, nsum = 0, 0
     train_losses, test_losses = np.zeros(total_epochs), np.zeros(total_epochs)
     global_epoch = 0
+
+    resume_path = (filename.with_name(filename.name + "_resume.pt")
+                   if resume_path is None else Path(resume_path))
+    resume_istage, resume_stage_epoch, resume_optimizer_state = 1, 0, None
+    if resume:
+        resumed = _load_resume_checkpoint(resume_path, net, stages, total_epochs)
+        if resumed is not None:
+            resume_istage = resumed["istage"]
+            resume_stage_epoch = resumed["stage_epoch"]
+            global_epoch = resumed["global_epoch"]
+            resume_optimizer_state = resumed["optimizer_state"]
+            train_losses, test_losses = resumed["train_losses"], resumed["test_losses"]
+            if global_epoch >= total_epochs:
+                train_logger.warning(
+                    "resume checkpoint %s is already at the end of the schedule "
+                    "(%d/%d epochs); no training will run. Pass resume=False or "
+                    "delete the checkpoint to retrain.",
+                    resume_path, global_epoch, total_epochs,
+                )
+    if resume_every > 0:
+        train_logger.info(">>> resume checkpointing every %d epochs to %s",
+                          resume_every, resume_path)
+
     for istage, stage in enumerate(stages, start=1):
+        if istage < resume_istage:
+            continue
         lavg, nsum = 0, 0
         train_logger.info(
             ">>> stage %d/%d %s: trainable_mode=%s, n_epochs=%d, learning_rate=%0.6g, warmup_epochs=%d",
@@ -625,12 +742,23 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             )
         optimizer = torch.optim.AdamW(trainable_params, lr=stage["learning_rate"],
                                       weight_decay=weight_decay)
+        if resume_optimizer_state is not None and istage == resume_istage:
+            try:
+                optimizer.load_state_dict(resume_optimizer_state)
+                train_logger.info(">>> restored optimizer state for stage %d", istage)
+            except ValueError as exc:
+                train_logger.warning(
+                    "could not restore optimizer state (%s); continuing with a fresh "
+                    "optimizer for this stage", exc,
+                )
+            resume_optimizer_state = None
         LR = _learning_rate_schedule(
             stage["n_epochs"], stage["learning_rate"],
             warmup_epochs=stage["warmup_epochs"],
             decay_schedule=stage["decay_schedule"],
         )
-        for stage_epoch in range(stage["n_epochs"]):
+        first_stage_epoch = resume_stage_epoch if istage == resume_istage else 0
+        for stage_epoch in range(first_stage_epoch, stage["n_epochs"]):
             iepoch = global_epoch
             np.random.seed(iepoch)
             if nimg != nimg_per_epoch:
@@ -730,6 +858,13 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                     filename0 = filename
                 train_logger.info(f"saving network parameters to {filename0}")
                 net.save_model(filename0)
+
+            if resume_every > 0 and ((stage_epoch + 1) % resume_every == 0 or
+                                     stage_epoch == stage["n_epochs"] - 1):
+                _save_resume_checkpoint(
+                    resume_path, net, optimizer, istage, stage_epoch, global_epoch,
+                    train_losses, test_losses, stages,
+                )
             global_epoch += 1
     
     net.save_model(filename)

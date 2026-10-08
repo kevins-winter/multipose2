@@ -4,6 +4,7 @@ import os, shutil
 import torch
 from pathlib import Path
 import numpy as np
+import pytest
 
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -294,3 +295,215 @@ def test_trainable_mode_all_still_trains_encoder_and_adapter():
     assert net.encoder.pos_embed.requires_grad
     assert net.input_adapter.proj.weight.requires_grad
     assert net.out.weight.requires_grad
+
+
+class _TinyNet(torch.nn.Module):
+    """Minimal stand-in exposing what the resume helpers touch."""
+
+    def __init__(self, in_channels=5, adapter_type="linear"):
+        super().__init__()
+        self.lin = torch.nn.Linear(4, 4)
+        self.in_channels = in_channels
+        self.adapter_type = adapter_type
+
+    def forward(self, x):
+        return self.lin(x)
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+
+def _tiny_stages():
+    return train._normalize_training_stages(
+        [{"name": "s1", "trainable_mode": "all", "n_epochs": 3, "learning_rate": 1e-5},
+         {"name": "s2", "trainable_mode": "all", "n_epochs": 2, "learning_rate": 1e-6}],
+        n_epochs=5, learning_rate=1e-5, trainable_mode="all",
+        n_trainable_blocks=2, warmup_epochs=0,
+    )
+
+
+def _save_tiny(tmp_path, net, stages, istage, stage_epoch, global_epoch,
+               train_losses=None, test_losses=None):
+    opt = torch.optim.AdamW(net.parameters(), lr=1e-5)
+    net(torch.zeros(2, 4)).sum().backward()
+    opt.step()
+    path = tmp_path / "run_resume.pt"
+    train._save_resume_checkpoint(
+        path, net, opt, istage, stage_epoch, global_epoch,
+        np.zeros(5) if train_losses is None else train_losses,
+        np.zeros(5) if test_losses is None else test_losses,
+        stages,
+    )
+    return path
+
+
+def test_resume_checkpoint_roundtrip_restores_position_and_weights(tmp_path):
+    stages = _tiny_stages()
+    net = _TinyNet()
+    losses = np.arange(5, dtype="float64")
+    path = _save_tiny(tmp_path, net, stages, istage=1, stage_epoch=1, global_epoch=1,
+                      train_losses=losses)
+    saved_weight = net.lin.weight.detach().clone()
+
+    fresh = _TinyNet()
+    with torch.no_grad():
+        fresh.lin.weight.fill_(0.0)
+    resumed = train._load_resume_checkpoint(path, fresh, stages, total_epochs=5)
+
+    # the saved epoch is the one that completed, so resume starts at the next
+    assert resumed["istage"] == 1
+    assert resumed["stage_epoch"] == 2
+    assert resumed["global_epoch"] == 2
+    assert np.array_equal(resumed["train_losses"], losses)
+    assert torch.equal(fresh.lin.weight, saved_weight)
+    assert resumed["optimizer_state"]["state"]
+
+
+def test_resume_at_stage_end_rolls_over_to_next_stage(tmp_path):
+    stages = _tiny_stages()
+    net = _TinyNet()
+    # last epoch of stage 1 (n_epochs=3) completed
+    path = _save_tiny(tmp_path, net, stages, istage=1, stage_epoch=2, global_epoch=2)
+    resumed = train._load_resume_checkpoint(path, _TinyNet(), stages, total_epochs=5)
+    # stage_epoch == n_epochs makes range(first, n_epochs) empty, so stage 1 is
+    # skipped and stage 2 starts at 0
+    assert resumed["stage_epoch"] == stages[0]["n_epochs"]
+    assert range(resumed["stage_epoch"], stages[0]["n_epochs"]) == range(3, 3)
+    assert resumed["global_epoch"] == 3
+
+
+def test_resume_checkpoint_rejects_changed_schedule(tmp_path):
+    stages = _tiny_stages()
+    path = _save_tiny(tmp_path, _TinyNet(), stages, 1, 0, 0)
+    changed = train._normalize_training_stages(
+        [{"name": "s1", "trainable_mode": "all", "n_epochs": 4, "learning_rate": 1e-5},
+         {"name": "s2", "trainable_mode": "all", "n_epochs": 2, "learning_rate": 1e-6}],
+        n_epochs=6, learning_rate=1e-5, trainable_mode="all",
+        n_trainable_blocks=2, warmup_epochs=0,
+    )
+    with pytest.raises(ValueError, match="different training schedule"):
+        train._load_resume_checkpoint(path, _TinyNet(), changed, total_epochs=6)
+
+
+def test_resume_checkpoint_rejects_mismatched_model_shape(tmp_path):
+    stages = _tiny_stages()
+    path = _save_tiny(tmp_path, _TinyNet(in_channels=5), stages, 1, 0, 0)
+    with pytest.raises(ValueError, match="in_channels"):
+        train._load_resume_checkpoint(path, _TinyNet(in_channels=8), stages,
+                                      total_epochs=5)
+
+
+def test_resume_checkpoint_write_is_atomic_and_absent_returns_none(tmp_path):
+    stages = _tiny_stages()
+    path = _save_tiny(tmp_path, _TinyNet(), stages, 1, 0, 0)
+    assert path.exists()
+    assert not list(tmp_path.glob("*.tmp"))
+    assert train._load_resume_checkpoint(tmp_path / "nope.pt", _TinyNet(), stages, 5) is None
+
+
+class _Interrupted(RuntimeError):
+    """Stands in for a Colab disconnect part-way through training."""
+
+
+class _FakeSegNet(torch.nn.Module):
+    """Tiny stand-in for Transformer: same interface train_seg needs, trivial compute."""
+
+    def __init__(self, nchan=2, fail_after_steps=None):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(nchan, 3, 1)
+        self.in_channels = nchan
+        self.adapter_type = "linear"
+        self.diam_mean = torch.nn.Parameter(torch.tensor([30.]), requires_grad=False)
+        self.diam_labels = torch.nn.Parameter(torch.tensor([30.]), requires_grad=False)
+        self.W2 = torch.nn.Parameter(torch.ones(1), requires_grad=False)
+        self.steps = 0
+        self.fail_after_steps = fail_after_steps
+
+    def forward(self, x):
+        if self.training:
+            self.steps += 1
+            if self.fail_after_steps is not None and self.steps > self.fail_after_steps:
+                raise _Interrupted(f"killed at step {self.steps}")
+        return self.conv(x), torch.zeros((x.shape[0], 256))
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def dtype(self):
+        return torch.float32
+
+    @dtype.setter
+    def dtype(self, value):
+        pass
+
+    def save_model(self, filename):
+        torch.save(self.state_dict(), filename)
+
+
+def _fake_training_data(n=4, size=64, nchan=2):
+    rng = np.random.default_rng(0)
+    data = [rng.random((nchan, size, size), dtype="float32") for _ in range(n)]
+    labels = []
+    for _ in range(n):
+        lbl = np.zeros((size, size), dtype="uint16")
+        lbl[8:24, 8:24] = 1
+        lbl[40:56, 40:56] = 2
+        labels.append(lbl)
+    return data, labels
+
+
+_RESUME_STAGES = [
+    {"name": "s1", "trainable_mode": "all", "n_epochs": 2, "learning_rate": 1e-4,
+     "warmup_epochs": 0},
+    {"name": "s2", "trainable_mode": "all", "n_epochs": 2, "learning_rate": 1e-5,
+     "warmup_epochs": 0},
+]
+
+
+def _run(net, tmp_path, resume, resume_path):
+    data, labels = _fake_training_data()
+    return train.train_seg(
+        net, train_data=data, train_labels=labels, channel_axis=0,
+        training_stages=[dict(s) for s in _RESUME_STAGES],
+        batch_size=2, bsize=32, normalize=False, min_train_masks=0,
+        save_path=str(tmp_path), model_name="t", rescale=False,
+        resume=resume, resume_every=1, resume_path=str(resume_path),
+    )
+
+
+def test_train_seg_resume_skips_completed_epochs(tmp_path):
+    resume_path = tmp_path / "t_resume.pt"
+
+    # die part-way through epoch 1, after epoch 0 has been checkpointed
+    interrupted = _FakeSegNet(fail_after_steps=3)
+    with pytest.raises(_Interrupted):
+        _run(interrupted, tmp_path, resume=True, resume_path=resume_path)
+    assert resume_path.exists()
+    ckpt = torch.load(resume_path, weights_only=False)
+    assert ckpt["global_epoch"] == 0
+    loss_before = float(ckpt["train_losses"][0])
+    assert loss_before > 0
+
+    # resume with a fresh net and finish the schedule
+    resumed = _FakeSegNet()
+    _, train_losses, _ = _run(resumed, tmp_path, resume=True, resume_path=resume_path)
+
+    assert len(train_losses) == 4
+    # the completed epoch's loss came back from the checkpoint, not from rerunning it
+    assert float(train_losses[0]) == loss_before
+    # every later epoch ran, including across the stage boundary at epoch 2
+    assert np.all(train_losses[1:] > 0)
+    # 3 remaining epochs x 2 batches, and no epoch replayed
+    assert resumed.steps == 6
+
+
+def test_train_seg_without_resume_runs_every_epoch(tmp_path):
+    resume_path = tmp_path / "fresh_resume.pt"
+    net = _FakeSegNet()
+    _, train_losses, _ = _run(net, tmp_path, resume=False, resume_path=resume_path)
+    assert np.all(train_losses > 0)
+    assert net.steps == 8
+    assert resume_path.exists()
