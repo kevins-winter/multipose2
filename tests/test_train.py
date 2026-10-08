@@ -557,3 +557,50 @@ def test_timing_can_be_disabled(tmp_path):
         model_name="notiming", rescale=False, timing=False,
     )
     assert not (tmp_path / "models" / "notiming_timing.jsonl").exists()
+
+
+def test_read_and_summarize_timing_roundtrip(tmp_path):
+    net = _FakeSegNet()
+    _run(net, tmp_path, resume=False, resume_path=tmp_path / "unused.pt")
+
+    records = train.read_timing_records(tmp_path / "models" / "t_timing.jsonl")
+    assert len(records) == 4
+
+    summary = train.summarize_timing(records)
+    assert summary["n_epochs"] == 4
+    assert summary["total_s"] > 0
+    assert summary["median_epoch_s"] > 0
+    assert set(summary["phase_pct"]) == set(train.TIMING_PHASES)
+    # shares are percentages of total wall time, so they cannot exceed 100
+    assert 0 <= sum(summary["phase_pct"].values()) <= 100.5
+    assert summary["bottleneck"] in train.TIMING_PHASES
+    assert summary["hint"] == train.TIMING_HINTS[summary["bottleneck"]]
+    assert summary["peak_gpu_gb"] is None  # CPU run
+
+
+def test_summarize_timing_handles_empty_and_missing():
+    assert train.summarize_timing([]) is None
+    assert train.read_timing_records("/nonexistent/timing.jsonl") == []
+
+
+def test_read_timing_records_skips_truncated_final_line(tmp_path):
+    path = tmp_path / "timing.jsonl"
+    good = {"epoch": 0, "wall_s": 1.0, "step_s": 0.5}
+    path.write_text(json.dumps(good) + "\n" + '{"epoch": 1, "wall_s":')
+    records = train.read_timing_records(path)
+    assert records == [good]
+
+
+def test_summarize_timing_picks_the_dominant_phase():
+    records = [
+        {"wall_s": 10.0, "batch_s": 1.0, "augment_s": 7.0, "step_s": 1.0,
+         "imgs_per_s": 2.0, "peak_gpu_gb": 3.5},
+        {"wall_s": 10.0, "batch_s": 1.0, "augment_s": 7.0, "step_s": 1.0,
+         "imgs_per_s": 4.0, "peak_gpu_gb": 4.25},
+    ]
+    summary = train.summarize_timing(records)
+    assert summary["bottleneck"] == "augment"
+    assert summary["phase_pct"]["augment"] == 70.0
+    assert summary["mean_imgs_per_s"] == 3.0
+    assert summary["peak_gpu_gb"] == 4.25
+    assert "prefetch" in summary["hint"]

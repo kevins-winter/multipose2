@@ -17,6 +17,16 @@ train_logger = logging.getLogger(__name__)
 # parameter names that are frozen by the architecture, never optimized
 NEVER_TRAINABLE_PARAMS = frozenset({"W2", "diam_mean", "diam_labels"})
 
+# phases each epoch is split into for timing, and what to do about each
+TIMING_PHASES = ("batch", "augment", "step", "test", "save")
+TIMING_HINTS = {
+    "augment": "augmentation dominates: raise batch_size and prefetch batches in worker processes",
+    "batch": "batch assembly dominates: training data is on slow storage, copy it to local disk",
+    "step": "the GPU step dominates: raise batch_size, and check autocast is active (a float32 dtype disables it)",
+    "test": "validation dominates: lower nimg_test_per_epoch",
+    "save": "checkpointing dominates: raise resume_every, or write checkpoints to local disk",
+}
+
 def _loss_fn_class(lbl, y, class_weights=None):
     """
     Calculates the loss function between true labels lbl and prediction y.
@@ -323,31 +333,82 @@ def _append_timing_record(path, record):
         train_logger.warning("could not write timing record to %s (%s)", path, exc)
 
 
-def _log_timing_summary(records):
-    """Summarize where training time went, and name the phase worth attacking."""
+def read_timing_records(path):
+    """Read per-epoch timing records written by train_seg(timing=True).
+
+    Args:
+        path (str or Path): A ``<model_name>_timing.jsonl`` file.
+
+    Returns:
+        list of dict: One record per epoch, empty if the file does not exist.
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    records = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            # a run killed mid-write can leave a partial final line
+            train_logger.warning("skipping malformed timing record in %s", path)
+    return records
+
+
+def summarize_timing(records):
+    """Summarize per-epoch timings and name the phase worth attacking first.
+
+    Args:
+        records (list of dict): Records from read_timing_records().
+
+    Returns:
+        dict or None: Totals, per-phase seconds and percentages, peak GPU memory,
+        the dominant phase and a suggestion for it. None if there are no records.
+    """
     if not records:
-        return
-    phases = ("batch", "augment", "step", "test", "save")
+        return None
     walls = sorted(r["wall_s"] for r in records)
-    total = sum(walls)
-    if total <= 0:
+    total = float(sum(walls))
+    phase_s = {p: float(sum(r.get(p + "_s", 0.) for r in records))
+               for p in TIMING_PHASES}
+    if total > 0:
+        phase_pct = {p: round(100. * phase_s[p] / total, 1) for p in TIMING_PHASES}
+        bottleneck = max(phase_pct, key=phase_pct.get)
+    else:
+        phase_pct = {p: 0. for p in TIMING_PHASES}
+        bottleneck = None
+    rates = [r["imgs_per_s"] for r in records if r.get("imgs_per_s")]
+    peaks = [r["peak_gpu_gb"] for r in records if r.get("peak_gpu_gb")]
+    return {
+        "n_epochs": len(records),
+        "total_s": round(total, 3),
+        "total_min": round(total / 60., 2),
+        "median_epoch_s": round(walls[len(walls) // 2], 3),
+        "mean_imgs_per_s": round(sum(rates) / len(rates), 3) if rates else None,
+        "phase_s": {p: round(v, 3) for p, v in phase_s.items()},
+        "phase_pct": phase_pct,
+        "peak_gpu_gb": max(peaks) if peaks else None,
+        "bottleneck": bottleneck,
+        "hint": TIMING_HINTS.get(bottleneck),
+    }
+
+
+def _log_timing_summary(records):
+    """Log where training time went, and the phase worth attacking."""
+    summary = summarize_timing(records)
+    if summary is None or summary["total_s"] <= 0:
         return
-    shares = {p: 100. * sum(r.get(p + "_s", 0.) for r in records) / total
-              for p in phases}
     train_logger.info(
         ">>> timing over %d epochs: median %.2fs/epoch, total %.1f min | "
-        + ", ".join(f"{p} %.0f%%" for p in phases),
-        len(records), walls[len(walls) // 2], total / 60.,
-        *(shares[p] for p in phases),
+        + ", ".join(f"{p} %.0f%%" for p in TIMING_PHASES),
+        summary["n_epochs"], summary["median_epoch_s"], summary["total_min"],
+        *(summary["phase_pct"][p] for p in TIMING_PHASES),
     )
-    hints = {
-        "augment": "augmentation dominates: raise batch_size and prefetch batches in worker processes",
-        "batch": "batch assembly dominates: training data is on slow storage, copy it to local disk",
-        "step": "the GPU step dominates: raise batch_size, and check autocast is active (a float32 dtype disables it)",
-        "test": "validation dominates: lower nimg_test_per_epoch",
-        "save": "checkpointing dominates: raise resume_every, or write checkpoints to local disk",
-    }
-    train_logger.info(">>> %s", hints[max(shares, key=shares.get)])
+    if summary["hint"]:
+        train_logger.info(">>> %s", summary["hint"])
 
 
 def _stage_fingerprint(stages):
