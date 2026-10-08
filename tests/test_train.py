@@ -4,6 +4,7 @@ import os, shutil
 import torch
 from pathlib import Path
 import numpy as np
+import json
 import pytest
 
 
@@ -507,3 +508,52 @@ def test_train_seg_without_resume_runs_every_epoch(tmp_path):
     assert np.all(train_losses > 0)
     assert net.steps == 8
     assert resume_path.exists()
+
+
+def test_timing_records_one_line_per_epoch_with_sane_phases(tmp_path):
+    net = _FakeSegNet()
+    _run(net, tmp_path, resume=False, resume_path=tmp_path / "unused_resume.pt")
+
+    timing_file = tmp_path / "models" / "t_timing.jsonl"
+    assert timing_file.exists()
+    records = [json.loads(line) for line in timing_file.read_text().splitlines()]
+
+    assert [r["epoch"] for r in records] == [0, 1, 2, 3]
+    assert [r["stage"] for r in records] == ["s1", "s1", "s2", "s2"]
+    for r in records:
+        for key in ("wall_s", "batch_s", "augment_s", "step_s", "test_s", "save_s",
+                    "imgs_per_s", "lr", "train_loss", "nimg", "batch_size"):
+            assert key in r, key
+        assert all(r[k] >= 0 for k in ("batch_s", "augment_s", "step_s", "test_s", "save_s"))
+        # the phases are disjoint sub-intervals of the epoch
+        assert r["batch_s"] + r["augment_s"] + r["step_s"] <= r["wall_s"] + 1e-6
+        assert r["nimg"] == 4 and r["batch_size"] == 2
+        assert r["peak_gpu_gb"] is None  # CPU run
+
+
+def test_timing_appends_across_a_resume(tmp_path):
+    resume_path = tmp_path / "t_resume.pt"
+    timing_file = tmp_path / "models" / "t_timing.jsonl"
+
+    interrupted = _FakeSegNet(fail_after_steps=3)
+    with pytest.raises(_Interrupted):
+        _run(interrupted, tmp_path, resume=True, resume_path=resume_path)
+    before = len(timing_file.read_text().splitlines())
+    assert before == 1
+
+    _run(_FakeSegNet(), tmp_path, resume=True, resume_path=resume_path)
+    records = [json.loads(line) for line in timing_file.read_text().splitlines()]
+    # the pre-interruption epoch is kept, and the resumed epochs are appended
+    assert len(records) == 4
+    assert [r["epoch"] for r in records] == [0, 1, 2, 3]
+
+
+def test_timing_can_be_disabled(tmp_path):
+    data, labels = _fake_training_data()
+    train.train_seg(
+        _FakeSegNet(), train_data=data, train_labels=labels, channel_axis=0,
+        training_stages=[dict(_RESUME_STAGES[0])], batch_size=2, bsize=32,
+        normalize=False, min_train_masks=0, save_path=str(tmp_path),
+        model_name="notiming", rescale=False, timing=False,
+    )
+    assert not (tmp_path / "models" / "notiming_timing.jsonl").exists()

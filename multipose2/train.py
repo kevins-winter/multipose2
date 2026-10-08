@@ -1,5 +1,7 @@
 import time
 import os
+import json
+from contextlib import contextmanager
 import numpy as np
 from . import io, utils, models, dynamics
 from .transforms import normalize_img, random_rotate_and_resize
@@ -280,6 +282,72 @@ def _normalize_training_stages(training_stages, n_epochs, learning_rate,
             "decay_schedule": stage.get("decay_schedule", False),
         })
     return stages
+
+
+class _PhaseTimer:
+    """Accumulate wall time per named phase within one epoch."""
+
+    def __init__(self):
+        self.totals = {}
+
+    @contextmanager
+    def phase(self, name):
+        t0 = time.time()
+        try:
+            yield
+        finally:
+            self.totals[name] = self.totals.get(name, 0.) + (time.time() - t0)
+
+    def add(self, name, seconds):
+        self.totals[name] = self.totals.get(name, 0.) + seconds
+
+    def get(self, name):
+        return self.totals.get(name, 0.)
+
+
+def _peak_gpu_memory_gb(device):
+    """Peak allocated GPU memory since the last reset, or None off CUDA."""
+    if device is None or device.type != "cuda":
+        return None
+    return round(torch.cuda.max_memory_allocated(device) / 1024**3, 3)
+
+
+def _append_timing_record(path, record):
+    """Append one JSON line per epoch, so a killed run still leaves its timings."""
+    if path is None:
+        return
+    try:
+        with open(path, "a") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        train_logger.warning("could not write timing record to %s (%s)", path, exc)
+
+
+def _log_timing_summary(records):
+    """Summarize where training time went, and name the phase worth attacking."""
+    if not records:
+        return
+    phases = ("batch", "augment", "step", "test", "save")
+    walls = sorted(r["wall_s"] for r in records)
+    total = sum(walls)
+    if total <= 0:
+        return
+    shares = {p: 100. * sum(r.get(p + "_s", 0.) for r in records) / total
+              for p in phases}
+    train_logger.info(
+        ">>> timing over %d epochs: median %.2fs/epoch, total %.1f min | "
+        + ", ".join(f"{p} %.0f%%" for p in phases),
+        len(records), walls[len(walls) // 2], total / 60.,
+        *(shares[p] for p in phases),
+    )
+    hints = {
+        "augment": "augmentation dominates: raise batch_size and prefetch batches in worker processes",
+        "batch": "batch assembly dominates: training data is on slow storage, copy it to local disk",
+        "step": "the GPU step dominates: raise batch_size, and check autocast is active (a float32 dtype disables it)",
+        "test": "validation dominates: lower nimg_test_per_epoch",
+        "save": "checkpointing dominates: raise resume_every, or write checkpoints to local disk",
+    }
+    train_logger.info(">>> %s", hints[max(shares, key=shares.get)])
 
 
 def _stage_fingerprint(stages):
@@ -574,7 +642,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               min_train_masks=5, model_name=None, class_weights=None,
               trainable_mode="all", n_trainable_blocks=2, warmup_epochs=10,
               training_stages=None, resume=False, resume_every=0,
-              resume_path=None):
+              resume_path=None, timing=True, timing_path=None):
     """
     Train the network with images for segmentation.
 
@@ -613,6 +681,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         resume (bool, optional): Load the checkpoint at resume_path, if it exists, and continue from the epoch after the one it recorded. Raises if the checkpoint was written for a different schedule or a differently shaped model. Defaults to False.
         resume_every (int, optional): Write a resume checkpoint every N epochs within each stage, and always at the end of a stage. 0 disables resume checkpointing. The checkpoint holds the full model and optimizer state, so it is roughly the model size plus two floats per trainable parameter; prefer local disk over a network drive. Defaults to 0.
         resume_path (str or Path, optional): Where the resume checkpoint is written and read. Defaults to save_path/models/<model_name>_resume.pt. Note that data preprocessing and flow computation are not cached, so they re-run on resume.
+        timing (bool, optional): Log per-epoch wall time broken down into batch assembly, augmentation, the GPU step, validation and checkpointing, and append one JSON line per epoch to timing_path. The breakdown adds no CUDA synchronisation of its own, because loss.item() already synchronises at the end of each step. Defaults to True.
+        timing_path (str or Path, optional): Where per-epoch timing records are appended as JSON lines. Defaults to save_path/models/<model_name>_timing.jsonl.
 
     Returns:
         tuple: A tuple containing the path to the saved model weights, training losses, and test losses.
@@ -702,6 +772,10 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
     resume_path = (filename.with_name(filename.name + "_resume.pt")
                    if resume_path is None else Path(resume_path))
+    timing_path = (filename.with_name(filename.name + "_timing.jsonl")
+                   if timing_path is None else Path(timing_path)) if timing else None
+    timing_records = []
+
     resume_istage, resume_stage_epoch, resume_optimizer_state = 1, 0, None
     if resume:
         resumed = _load_resume_checkpoint(resume_path, net, stages, total_epochs)
@@ -760,6 +834,10 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         first_stage_epoch = resume_stage_epoch if istage == resume_istage else 0
         for stage_epoch in range(first_stage_epoch, stage["n_epochs"]):
             iepoch = global_epoch
+            timer = _PhaseTimer()
+            epoch_t0 = time.time()
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
             np.random.seed(iepoch)
             if nimg != nimg_per_epoch:
                 # choose random images for epoch with probability train_probs
@@ -774,30 +852,35 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             for k in range(0, nimg_per_epoch, batch_size):
                 kend = min(k + batch_size, nimg_per_epoch)
                 inds = rperm[k:kend]
-                imgs, lbls = _get_batch(inds, data=train_data, labels=train_labels,
-                                        files=train_files, labels_files=train_labels_files,
-                                        **kwargs)
-                diams = np.array([diam_train[i] for i in inds])
-                rsc = diams / net.diam_mean.item() if rescale else np.ones(
-                    len(diams), "float32")
+                with timer.phase("batch"):
+                    imgs, lbls = _get_batch(inds, data=train_data, labels=train_labels,
+                                            files=train_files, labels_files=train_labels_files,
+                                            **kwargs)
+                    diams = np.array([diam_train[i] for i in inds])
+                    rsc = diams / net.diam_mean.item() if rescale else np.ones(
+                        len(diams), "float32")
                 # augmentations
-                imgi, lbl = random_rotate_and_resize(imgs, Y=lbls, rescale=rsc,
-                                                                scale_range=scale_range,
-                                                                xy=(bsize, bsize))[:2]
+                with timer.phase("augment"):
+                    imgi, lbl = random_rotate_and_resize(imgs, Y=lbls, rescale=rsc,
+                                                                    scale_range=scale_range,
+                                                                    xy=(bsize, bsize))[:2]
                 # network and loss optimization
-                X = torch.from_numpy(imgi).to(device)
-                lbl = torch.from_numpy(lbl).to(device)
+                # loss.item() synchronises, so this phase measures the real GPU
+                # cost without adding a sync of its own
+                with timer.phase("step"):
+                    X = torch.from_numpy(imgi).to(device)
+                    lbl = torch.from_numpy(lbl).to(device)
 
-                with torch.autocast(device_type=device.type, dtype=net.dtype):
-                    y = net(X)[0]
-                loss = _loss_fn_seg(lbl, y, device)
-                if y.shape[1] > 3:
-                    loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                    loss += loss3
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                train_loss = loss.item()
+                    with torch.autocast(device_type=device.type, dtype=net.dtype):
+                        y = net(X)[0]
+                    loss = _loss_fn_seg(lbl, y, device)
+                    if y.shape[1] > 3:
+                        loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
+                        loss += loss3
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    train_loss = loss.item()
                 train_loss *= len(imgi)
 
                 # keep track of average training loss across epochs
@@ -810,6 +893,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             should_log = iepoch == 5 or iepoch % 10 == 0 or stage_epoch == 0
             if should_log:
                 lavgt = 0.
+                _test_t0 = time.time()
                 if test_data is not None or test_files is not None:
                     np.random.seed(42)
                     if nimg_test != nimg_test_per_epoch:
@@ -845,6 +929,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                             lavgt += test_loss
                     lavgt /= len(rperm)
                     test_losses[iepoch] = lavgt
+                timer.add("test", time.time() - _test_t0)
                 lavg /= nsum
                 train_logger.info(
                     f"{iepoch}, stage={stage['name']}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[stage_epoch]:.6f}, time {time.time()-t0:.2f}s"
@@ -857,16 +942,52 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                 else:
                     filename0 = filename
                 train_logger.info(f"saving network parameters to {filename0}")
-                net.save_model(filename0)
+                with timer.phase("save"):
+                    net.save_model(filename0)
 
             if resume_every > 0 and ((stage_epoch + 1) % resume_every == 0 or
                                      stage_epoch == stage["n_epochs"] - 1):
-                _save_resume_checkpoint(
-                    resume_path, net, optimizer, istage, stage_epoch, global_epoch,
-                    train_losses, test_losses, stages,
+                with timer.phase("save"):
+                    _save_resume_checkpoint(
+                        resume_path, net, optimizer, istage, stage_epoch, global_epoch,
+                        train_losses, test_losses, stages,
+                    )
+
+            if timing:
+                epoch_wall = time.time() - epoch_t0
+                record = {
+                    "epoch": iepoch, "stage": stage["name"], "istage": istage,
+                    "stage_epoch": stage_epoch,
+                    "wall_s": round(epoch_wall, 3),
+                    "batch_s": round(timer.get("batch"), 3),
+                    "augment_s": round(timer.get("augment"), 3),
+                    "step_s": round(timer.get("step"), 3),
+                    "test_s": round(timer.get("test"), 3),
+                    "save_s": round(timer.get("save"), 3),
+                    "nimg": int(nimg_per_epoch),
+                    "batch_size": int(batch_size),
+                    "imgs_per_s": round(nimg_per_epoch / epoch_wall, 3) if epoch_wall > 0 else None,
+                    "lr": float(LR[stage_epoch]),
+                    "train_loss": float(train_losses[iepoch]),
+                    "peak_gpu_gb": _peak_gpu_memory_gb(device),
+                }
+                timing_records.append(record)
+                _append_timing_record(timing_path, record)
+                train_logger.info(
+                    "%d stage=%s wall=%.2fs (batch %.2f, augment %.2f, step %.2f, "
+                    "test %.2f, save %.2f) %.2f img/s%s",
+                    iepoch, stage["name"], epoch_wall, record["batch_s"],
+                    record["augment_s"], record["step_s"], record["test_s"],
+                    record["save_s"], record["imgs_per_s"] or 0.,
+                    f", peak {record['peak_gpu_gb']} GB" if record["peak_gpu_gb"] else "",
                 )
             global_epoch += 1
     
+    if timing:
+        _log_timing_summary(timing_records)
+        if timing_path is not None:
+            train_logger.info(">>> per-epoch timings written to %s", timing_path)
+
     net.save_model(filename)
     if original_net_dtype != torch.float32:
         train_logger.info(f">>> converting network back to {original_net_dtype} after training")
