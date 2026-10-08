@@ -27,6 +27,65 @@ TIMING_HINTS = {
     "save": "checkpointing dominates: raise resume_every, or write checkpoints to local disk",
 }
 
+_AMP_DTYPE_NAMES = {
+    "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+    "float16": torch.float16, "fp16": torch.float16, "half": torch.float16,
+}
+
+
+def _resolve_amp_dtype(amp_dtype, device):
+    """Choose the autocast dtype and whether gradient scaling is required.
+
+    The autocast dtype is independent of the dtype the weights are held in:
+    master weights stay float32 while the forward pass runs in reduced
+    precision. Passing a float32 autocast dtype disables autocast entirely,
+    which is why this never returns one.
+
+    Args:
+        amp_dtype: "auto", "bfloat16"/"bf16", "float16"/"fp16", a torch.dtype,
+            or None/False/"float32" to disable autocast.
+        device (torch.device): Device training will run on.
+
+    Returns:
+        tuple: (dtype or None, needs_scaler). A dtype of None disables autocast.
+        Gradient scaling is needed for float16, whose range underflows, but not
+        for bfloat16, which keeps float32's exponent range.
+    """
+    if amp_dtype in (None, False, "none", "float32", "fp32"):
+        return None, False
+
+    if amp_dtype in ("auto", True):
+        if device.type == "cuda":
+            dtype = (torch.bfloat16 if torch.cuda.is_bf16_supported()
+                     else torch.float16)
+        elif device.type == "cpu":
+            dtype = torch.bfloat16
+        else:
+            # mps and other backends have incomplete autocast coverage
+            train_logger.info(
+                ">>> autocast disabled: no automatic dtype for device type %r",
+                device.type)
+            return None, False
+    elif isinstance(amp_dtype, torch.dtype):
+        dtype = amp_dtype
+    elif isinstance(amp_dtype, str) and amp_dtype.lower() in _AMP_DTYPE_NAMES:
+        dtype = _AMP_DTYPE_NAMES[amp_dtype.lower()]
+    else:
+        raise ValueError(
+            "amp_dtype must be 'auto', 'bfloat16', 'float16', None, or a "
+            f"torch.dtype, got {amp_dtype!r}"
+        )
+
+    if (dtype == torch.bfloat16 and device.type == "cuda"
+            and not torch.cuda.is_bf16_supported()):
+        train_logger.warning(
+            "bfloat16 autocast requested but this GPU does not support it "
+            "(needs compute capability 8.0+); using float16 with gradient scaling"
+        )
+        dtype = torch.float16
+    return dtype, dtype == torch.float16
+
+
 def _loss_fn_class(lbl, y, class_weights=None):
     """
     Calculates the loss function between true labels lbl and prediction y.
@@ -393,6 +452,7 @@ def summarize_timing(records):
         "peak_gpu_gb": max(peaks) if peaks else None,
         "bottleneck": bottleneck,
         "hint": TIMING_HINTS.get(bottleneck),
+        "amp_dtype": records[-1].get("amp_dtype"),
     }
 
 
@@ -703,7 +763,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               min_train_masks=5, model_name=None, class_weights=None,
               trainable_mode="all", n_trainable_blocks=2, warmup_epochs=10,
               training_stages=None, resume=False, resume_every=0,
-              resume_path=None, timing=True, timing_path=None):
+              resume_path=None, timing=True, timing_path=None,
+              amp_dtype="auto"):
     """
     Train the network with images for segmentation.
 
@@ -744,6 +805,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         resume_path (str or Path, optional): Where the resume checkpoint is written and read. Defaults to save_path/models/<model_name>_resume.pt. Note that data preprocessing and flow computation are not cached, so they re-run on resume.
         timing (bool, optional): Log per-epoch wall time broken down into batch assembly, augmentation, the GPU step, validation and checkpointing, and append one JSON line per epoch to timing_path. The breakdown adds no CUDA synchronisation of its own, because loss.item() already synchronises at the end of each step. Defaults to True.
         timing_path (str or Path, optional): Where per-epoch timing records are appended as JSON lines. Defaults to save_path/models/<model_name>_timing.jsonl.
+        amp_dtype (str or torch.dtype, optional): Autocast dtype for the forward pass, independent of the float32 master weights. "auto" picks bfloat16 on a GPU that supports it, float16 with gradient scaling otherwise, and bfloat16 on CPU. Pass "bfloat16"/"float16" to force one, or None/"float32" to train in full float32. Defaults to "auto".
 
     Returns:
         tuple: A tuple containing the path to the saved model weights, training losses, and test losses.
@@ -759,6 +821,17 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         # NOTE: this produces a side effect of returning a network that is not of a guaranteed dtype \
         train_logger.info(">>> converting bfloat16 network to float32 for training")
         net.dtype = torch.float32
+
+    amp_torch_dtype, amp_needs_scaler = _resolve_amp_dtype(amp_dtype, device)
+    amp_enabled = amp_torch_dtype is not None
+    # autocast requires a reduced-precision dtype; float32 silently disables it
+    autocast_dtype = amp_torch_dtype or torch.float32
+    scaler = (torch.amp.GradScaler(device.type) if amp_needs_scaler else None)
+    amp_label = str(amp_torch_dtype).replace("torch.", "") if amp_enabled else "off"
+    train_logger.info(
+        ">>> autocast=%s, gradient scaling=%s", amp_label,
+        "on" if amp_needs_scaler else "off",
+    )
 
     scale_range = 0.5 if scale_range is None else scale_range
 
@@ -932,15 +1005,24 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                     X = torch.from_numpy(imgi).to(device)
                     lbl = torch.from_numpy(lbl).to(device)
 
-                    with torch.autocast(device_type=device.type, dtype=net.dtype):
+                    # the losses stay inside the autocast region so autocast's
+                    # own op policy promotes mse/bce/cross-entropy back to
+                    # float32 rather than running them in reduced precision
+                    with torch.autocast(device_type=device.type,
+                                        dtype=autocast_dtype, enabled=amp_enabled):
                         y = net(X)[0]
-                    loss = _loss_fn_seg(lbl, y, device)
-                    if y.shape[1] > 3:
-                        loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                        loss += loss3
+                        loss = _loss_fn_seg(lbl, y, device)
+                        if y.shape[1] > 3:
+                            loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
+                            loss += loss3
                     optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+                    if scaler is not None:
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        optimizer.step()
                     train_loss = loss.item()
                 train_loss *= len(imgi)
 
@@ -979,12 +1061,14 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                             X = torch.from_numpy(imgi).to(device)
                             lbl = torch.from_numpy(lbl).to(device)
 
-                            with torch.autocast(device_type=device.type, dtype=net.dtype):
+                            with torch.autocast(device_type=device.type,
+                                                dtype=autocast_dtype,
+                                                enabled=amp_enabled):
                                 y = net(X)[0]
-                            loss = _loss_fn_seg(lbl, y, device)
-                            if y.shape[1] > 3:
-                                loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
-                                loss += loss3
+                                loss = _loss_fn_seg(lbl, y, device)
+                                if y.shape[1] > 3:
+                                    loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
+                                    loss += loss3
                             test_loss = loss.item()
                             test_loss *= len(imgi)
                             lavgt += test_loss
@@ -1031,6 +1115,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                     "lr": float(LR[stage_epoch]),
                     "train_loss": float(train_losses[iepoch]),
                     "peak_gpu_gb": _peak_gpu_memory_gb(device),
+                    "amp_dtype": amp_label,
                 }
                 timing_records.append(record)
                 _append_timing_record(timing_path, record)

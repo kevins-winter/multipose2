@@ -571,8 +571,12 @@ def test_read_and_summarize_timing_roundtrip(tmp_path):
     assert summary["total_s"] > 0
     assert summary["median_epoch_s"] > 0
     assert set(summary["phase_pct"]) == set(train.TIMING_PHASES)
-    # shares are percentages of total wall time, so they cannot exceed 100
-    assert 0 <= sum(summary["phase_pct"].values()) <= 100.5
+    # The phases are disjoint sub-intervals of the epoch, so they cannot exceed
+    # the total wall time -- but records store milliseconds, and these fake
+    # epochs run in a few, so allow for rounding of wall_s plus five phases.
+    allowance = len(records) * 6 * 0.0005
+    assert sum(summary["phase_s"].values()) <= summary["total_s"] + allowance
+    assert sum(summary["phase_pct"].values()) > 0
     assert summary["bottleneck"] in train.TIMING_PHASES
     assert summary["hint"] == train.TIMING_HINTS[summary["bottleneck"]]
     assert summary["peak_gpu_gb"] is None  # CPU run
@@ -604,3 +608,111 @@ def test_summarize_timing_picks_the_dominant_phase():
     assert summary["mean_imgs_per_s"] == 3.0
     assert summary["peak_gpu_gb"] == 4.25
     assert "prefetch" in summary["hint"]
+
+
+def test_resolve_amp_dtype_disabled_forms():
+    cpu = torch.device("cpu")
+    for value in (None, False, "none", "float32", "fp32"):
+        assert train._resolve_amp_dtype(value, cpu) == (None, False)
+
+
+def test_resolve_amp_dtype_auto_on_cpu_is_bfloat16_without_scaler():
+    dtype, needs_scaler = train._resolve_amp_dtype("auto", torch.device("cpu"))
+    assert dtype == torch.bfloat16
+    # bfloat16 keeps float32's exponent range, so no gradient scaling
+    assert needs_scaler is False
+
+
+def test_resolve_amp_dtype_float16_requires_a_scaler():
+    for value in ("float16", "fp16", "half", torch.float16):
+        dtype, needs_scaler = train._resolve_amp_dtype(value, torch.device("cpu"))
+        assert dtype == torch.float16
+        assert needs_scaler is True
+
+
+def test_resolve_amp_dtype_accepts_explicit_bfloat16_and_rejects_junk():
+    cpu = torch.device("cpu")
+    assert train._resolve_amp_dtype("bf16", cpu) == (torch.bfloat16, False)
+    assert train._resolve_amp_dtype(torch.bfloat16, cpu) == (torch.bfloat16, False)
+    with pytest.raises(ValueError, match="amp_dtype must be"):
+        train._resolve_amp_dtype("float8", cpu)
+    with pytest.raises(ValueError, match="amp_dtype must be"):
+        train._resolve_amp_dtype(17, cpu)
+
+
+def test_resolve_amp_dtype_auto_is_disabled_on_unsupported_device():
+    assert train._resolve_amp_dtype("auto", torch.device("mps")) == (None, False)
+
+
+def test_amp_dtype_is_recorded_and_used(tmp_path):
+    """Training must run under autocast and say which dtype it used."""
+    data, labels = _fake_training_data()
+    net = _FakeSegNet()
+    train.train_seg(
+        net, train_data=data, train_labels=labels, channel_axis=0,
+        training_stages=[dict(_RESUME_STAGES[0])], batch_size=2, bsize=32,
+        normalize=False, min_train_masks=0, save_path=str(tmp_path),
+        model_name="amp", rescale=False, amp_dtype="bfloat16",
+    )
+    records = train.read_timing_records(tmp_path / "models" / "amp_timing.jsonl")
+    assert records and all(r["amp_dtype"] == "bfloat16" for r in records)
+    assert train.summarize_timing(records)["amp_dtype"] == "bfloat16"
+
+
+def test_amp_dtype_off_is_recorded_as_off(tmp_path):
+    data, labels = _fake_training_data()
+    train.train_seg(
+        _FakeSegNet(), train_data=data, train_labels=labels, channel_axis=0,
+        training_stages=[dict(_RESUME_STAGES[0])], batch_size=2, bsize=32,
+        normalize=False, min_train_masks=0, save_path=str(tmp_path),
+        model_name="noamp", rescale=False, amp_dtype=None,
+    )
+    records = train.read_timing_records(tmp_path / "models" / "noamp_timing.jsonl")
+    assert records and all(r["amp_dtype"] == "off" for r in records)
+
+
+def test_float16_path_runs_with_gradient_scaling(tmp_path):
+    """The float16 branch takes a different backward path, so exercise it."""
+    data, labels = _fake_training_data()
+    net = _FakeSegNet()
+    before = net.conv.weight.detach().clone()
+    train.train_seg(
+        net, train_data=data, train_labels=labels, channel_axis=0,
+        training_stages=[dict(_RESUME_STAGES[0])], batch_size=2, bsize=32,
+        normalize=False, min_train_masks=0, save_path=str(tmp_path),
+        model_name="fp16", rescale=False, amp_dtype="float16",
+    )
+    # the scaler must still have let the optimizer update the weights
+    assert not torch.equal(net.conv.weight, before)
+
+
+def test_autocast_actually_changes_the_forward_dtype(tmp_path):
+    """Regression guard: the forward pass must really run in reduced precision.
+
+    The original bug was that autocast was handed the master-weight dtype
+    (float32), which silently disabled it. Asserting on the dtype the network
+    actually sees is the only check that catches that.
+    """
+
+    class _DtypeSpy(_FakeSegNet):
+        def __init__(self):
+            super().__init__()
+            self.seen = set()
+
+        def forward(self, x):
+            out, style = super().forward(x)
+            self.seen.add(out.dtype)
+            return out, style
+
+    data, labels = _fake_training_data()
+    for amp, expected in (("bfloat16", torch.bfloat16),
+                          ("float16", torch.float16),
+                          (None, torch.float32)):
+        net = _DtypeSpy()
+        train.train_seg(
+            net, train_data=data, train_labels=labels, channel_axis=0,
+            training_stages=[dict(_RESUME_STAGES[0])], batch_size=2, bsize=32,
+            normalize=False, min_train_masks=0, save_path=str(tmp_path),
+            model_name=f"spy_{amp}", rescale=False, amp_dtype=amp,
+        )
+        assert net.seen == {expected}, f"amp_dtype={amp!r} gave {net.seen}"
