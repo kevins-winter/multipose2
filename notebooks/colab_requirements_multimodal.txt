@@ -1,26 +1,43 @@
-# Colab install:
-# !pip install -r https://raw.githubusercontent.com/kevins-winter/multipose2/multimodal-adapters/notebooks/colab_requirements_multimodal.txt
+# Colab install (note: no --upgrade, which would override Colab's CUDA torch):
+#   !pip install -q -r https://raw.githubusercontent.com/kevins-winter/multipose2/multimodal-adapters/notebooks/colab_requirements_multimodal.txt
+#
+# Pinning policy
+# --------------
+# Exact pins for packages Colab does not preinstall. These are ours to control
+# and cannot conflict with Colab's compiled stack, so they are pinned hard to
+# keep runs comparable across sessions.
+#
+# Floors, not pins, for numpy / scipy / torch / torchvision / matplotlib / tqdm.
+# Colab preinstalls these and builds its other compiled wheels against them.
+# Pinning torch especially can replace Colab's CUDA build with a wheel that does
+# not match the driver, and pinning numpy can break Colab's own compiled
+# packages. The numpy floor of 2.0 is deliberate: mixing numpy 2.x with wheels
+# built against 1.x is what produces "_ARRAY_API not found" / "numpy.core.
+# multiarray failed to import" part-way through a session.
+#
+# The preflight cell records the versions that actually resolved, so a run stays
+# identifiable even for the floored packages.
+#
+# For a reproducible rerun, replace the branch below with the commit that the
+# preflight cell reported for that run, e.g.
+#   git+https://github.com/kevins-winter/multipose2.git@e1b998a
 
-# Install this feature branch and its package dependencies.
 git+https://github.com/kevins-winter/multipose2.git@multimodal-adapters
 
-# Notebook/runtime utilities used by train_multipose2_multimodal_adapters.ipynb.
-matplotlib
-natsort
-tqdm
+# --- exact pins: not preinstalled by Colab ---
+fastremap==1.20.0
+fill-voids==2.1.2
+imagecodecs==2025.3.30
+natsort==8.4.0
+opencv-python-headless==5.0.0.93
+roifile==2025.12.12
+segment-anything==1.0
+tifffile==2025.5.10
 
-# Image IO and segmentation runtime dependencies.
-numpy>=1.23,<2.3
-scipy
-tifffile
-imagecodecs
-opencv-python-headless
-fastremap
-fill-voids
-roifile
-segment_anything
-
-# Colab normally includes CUDA-enabled torch/torchvision already. These are kept
-# unpinned so pip will not force a CPU-only downgrade when a compatible build is present.
-torch
-torchvision
+# --- floors: preinstalled by Colab, do not override its builds ---
+numpy>=2.0,<3
+scipy>=1.13
+torch>=2.4
+torchvision>=0.19
+matplotlib>=3.8
+tqdm>=4.66
