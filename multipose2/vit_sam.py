@@ -191,9 +191,25 @@ class Transformer(nn.Module):
         x1 = self.out(feat)
         return F.conv_transpose2d(x1, self.W2, stride = self.ps, padding = 0)
 
+    def set_role_mixer(self, role_mixer):
+        """Attach a RoleMixer, or None to remove one.
+
+        The mixer adds per-modality role terms to the base prediction at full
+        resolution. forward()'s signature is unchanged, so training and
+        inference need no special handling.
+        """
+        self.role_mixer = role_mixer
+        if role_mixer is not None:
+            self.role_mixer.to(device=self.device, dtype=self.dtype)
+        return self
+
     def forward(self, x):
         feat = self.forward_trunk(self.input_adapter(x))
         x1 = self.forward_head(feat)
+        if getattr(self, "role_mixer", None) is not None:
+            # role terms read the raw modality channels rather than trunk
+            # features, so each coefficient stays attributable to one modality
+            x1 = self.role_mixer(x1, x)
 
         # maintain the second output of feature size 256 for backwards compatibility
 
