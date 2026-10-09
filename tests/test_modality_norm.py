@@ -175,3 +175,40 @@ def test_train_seg_rejects_an_unfitted_normalizer():
 def test_train_seg_rejects_a_bad_normalize_argument():
     with pytest.raises(ValueError, match="bool, a dict, or a ModalityNormalizer"):
         train.train_seg(None, train_data=[], train_labels=[], normalize="yes")
+
+
+def test_subset_keeps_fitted_parameters_and_renumbers():
+    img = np.concatenate([_he(np.random.default_rng(0)), _counts(n=300)], axis=0)
+    norm = _layout()
+    norm.fit([img])
+
+    he_only = norm.subset([0, 1, 2])
+    assert he_only.n_channels == 3
+    assert [s.name for s in he_only.specs] == ["he"]
+    assert he_only.specs[0].channels == (0, 1, 2)
+    # normalizing the subset must match normalizing the full stack and slicing
+    assert np.allclose(he_only(img[:3]), norm(img)[:3])
+
+    tx_only = norm.subset([3])
+    assert tx_only.n_channels == 1
+    # the fitted scale is carried over, not refitted on the subset
+    assert tx_only.specs[0].fitted == norm.specs[1].fitted
+    assert np.allclose(tx_only(img[3:4]), norm(img)[3:4])
+
+
+def test_subset_respects_the_requested_order():
+    img = np.concatenate([_he(np.random.default_rng(0)), _counts(n=300)], axis=0)
+    norm = _layout()
+    norm.fit([img])
+    reordered = norm.subset([3, 0])
+    assert reordered.n_channels == 2
+    assert {s.name: s.channels for s in reordered.specs} == {"tx": (0,), "he": (1,)}
+    full = norm(img)
+    assert np.allclose(reordered(img[[3, 0]]), full[[3, 0]])
+
+
+def test_subset_of_nothing_raises():
+    norm = _layout()
+    norm.fit([np.concatenate([_he(np.random.default_rng(0)), _counts()], axis=0)])
+    with pytest.raises(ValueError, match="no modality covers"):
+        norm.subset([])

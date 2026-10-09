@@ -233,6 +233,37 @@ class ModalityNormalizer:
             out[idx] = spec.apply(out[idx])
         return np.moveaxis(out, 0, channel_axis)
 
+    def subset(self, channels):
+        """A normalizer covering only ``channels``, renumbered from zero.
+
+        Single-modality baselines evaluate a channel subset, and they must be
+        normalized exactly as those channels were during training -- refitting
+        on the subset would give a different transform and make the arm
+        incomparable. Each kept modality keeps its mode and its fitted
+        parameters; only the channel indices change.
+
+        Args:
+            channels (sequence of int): Channels to keep, in the order the
+                subset array presents them.
+
+        Returns:
+            ModalityNormalizer: Covering ``len(channels)`` channels.
+        """
+        channels = list(channels)
+        remap = {c: i for i, c in enumerate(channels)}
+        specs = []
+        for spec in self.specs:
+            kept = [c for c in spec.channels if c in remap]
+            if not kept:
+                continue
+            specs.append(ModalitySpec(
+                name=spec.name, channels=tuple(remap[c] for c in kept),
+                mode=spec.mode, params=dict(spec.params),
+                fitted=dict(spec.fitted)))
+        if not specs:
+            raise ValueError(f"no modality covers channels {channels}")
+        return ModalityNormalizer(specs)
+
     def channel_report(self, img, channel_axis=0):
         """Per-channel standard deviation before and after, for diagnostics.
 
