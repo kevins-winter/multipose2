@@ -105,6 +105,19 @@ _OFF = -10.0
 SUPPRESS_GAIN = 4.0
 
 
+def _groups(width):
+    """Largest group count up to four that divides ``width``.
+
+    GroupNorm requires the channel count to be divisible by the group count, so
+    a fixed min(4, width) fails for widths like 6, 10 or 21 -- which the
+    capacity-matched control picks freely.
+    """
+    for g in (4, 2, 1):
+        if width % g == 0:
+            return g
+    return 1
+
+
 def _sobel_kernels(dtype=torch.float32):
     """Fixed (d/dy, d/dx) kernels, shaped for a 1-channel input."""
     kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
@@ -124,7 +137,7 @@ class _RoleBranch(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, width, 3, padding=1),
-            nn.GroupNorm(min(4, width), width),
+            nn.GroupNorm(_groups(width), width),
             nn.GELU(),
             nn.Conv2d(width, nout, 3, padding=1),
         )
@@ -145,8 +158,13 @@ class RoleMixer(nn.Module):
             the foreground and flow slices are located as the loss locates them.
     """
 
-    def __init__(self, modalities, roles=ROLES, width=16, nout=3):
+    def __init__(self, modalities, roles=ROLES, width=16, nout=3,
+                 modality_dropout=0.):
         super().__init__()
+        if not 0. <= modality_dropout < 1.:
+            raise ValueError("modality_dropout must be in [0, 1)")
+        self.modality_dropout = float(modality_dropout)
+        self._presence_override = None
         self.modality_names = [str(name) for name, _ in modalities]
         self.modality_channels = [tuple(int(c) for c in ch) for _, ch in modalities]
         bad = set(roles) - set(ROLES)
@@ -204,14 +222,68 @@ class RoleMixer(nn.Module):
                 total = term if total is None else total + term
         return total
 
+    def set_presence(self, presence):
+        """Declare which modalities are available, or None to clear.
+
+        An unavailable modality and an observed modality reading zero are
+        different statements, and they must not produce the same correction.
+        Zeroing a channel's values says "we measured here and saw nothing",
+        which is evidence a branch can legitimately learn from. Marking it
+        absent says "this channel does not exist for this sample", which should
+        contribute nothing at all.
+
+        Args:
+            presence: None, or a tensor broadcastable to ``[N, n_modalities]``
+                where non-zero means available. A 1-D tensor of length
+                n_modalities applies to every sample.
+        """
+        if presence is None:
+            self._presence_override = None
+            return self
+        presence = torch.as_tensor(presence)
+        if presence.ndim == 1:
+            presence = presence.unsqueeze(0)
+        if presence.shape[-1] != len(self.modality_names):
+            raise ValueError(
+                f"presence must cover {len(self.modality_names)} modalities, "
+                f"got {presence.shape[-1]}")
+        self._presence_override = presence.to(torch.float32)
+        return self
+
+    def _presence(self, n, device, dtype):
+        """Per-sample availability, ``[N, n_modalities]``.
+
+        An explicit override wins. Otherwise modalities are all available,
+        except that during training modality_dropout marks some absent so the
+        model sees both regimes and does not come to depend on a channel that
+        may be missing at inference.
+        """
+        m = len(self.modality_names)
+        if self._presence_override is not None:
+            out = self._presence_override.to(device=device, dtype=dtype)
+            return out.expand(n, m) if out.shape[0] == 1 else out
+        if self.training and self.modality_dropout > 0.:
+            keep = (torch.rand((n, m), device=device) >= self.modality_dropout)
+            # never drop every modality at once; that supervises nothing
+            empty = ~keep.any(dim=1)
+            if empty.any():
+                keep[empty, torch.randint(0, m, (int(empty.sum()),),
+                                          device=device)] = True
+            return keep.to(dtype)
+        return torch.ones((n, m), device=device, dtype=dtype)
+
     def _terms(self, inputs, dtype):
         """Yield ``(modality, role, target, term)`` for every active role term.
 
         Shared by forward() and contribution_report(), so what is measured is
         exactly what is applied.
         """
-        for name, channels in zip(self.modality_names, self.modality_channels):
+        presence = self._presence(inputs.shape[0], inputs.device, dtype)
+        for i, (name, channels) in enumerate(zip(self.modality_names,
+                                                 self.modality_channels)):
             x_m = inputs[:, list(channels)]
+            # [N, 1, 1, 1], so an absent modality contributes exactly nothing
+            avail = presence[:, i].reshape(-1, 1, 1, 1)
             for role in self.roles:
                 coef = self.coefficient(name, role).to(dtype)
                 raw = self.branches[f"{name}__{role}"](x_m).to(dtype)
@@ -220,7 +292,7 @@ class RoleMixer(nn.Module):
                     term = coef * F.logsigmoid(SUPPRESS_GAIN * opinion)
                 else:
                     term = coef * opinion
-                yield name, role, ROLE_TARGET[role], term
+                yield name, role, ROLE_TARGET[role], term * avail
 
     def _flows_from_potential(self, potential):
         return F.conv2d(potential, self.sobel.to(potential.dtype), padding=1)
@@ -303,4 +375,102 @@ class RoleMixer(nn.Module):
 
     def extra_repr(self):
         return (f"modalities={self.modality_names}, roles={list(self.roles)}, "
+                f"modality_dropout={self.modality_dropout}, "
                 f"enabled={self.enabled}")
+
+
+class UnrestrictedCorrection(nn.Module):
+    """A correction network with the same parameter budget and no structure.
+
+    This is the control arm. RoleMixer imposes a specific structure -- one
+    branch per modality, separate routes to the foreground logit and the flow
+    field, a sign constraint on suppression, flows entered as the gradient of a
+    potential. Any improvement it shows over a frozen baseline could come from
+    that structure, or simply from the parameters the structure brought with it.
+
+    Without this control the comparison cannot distinguish the two, so a result
+    showing RoleMixer beats the baseline would say nothing about whether the
+    roles matter. This module reads every modality jointly, writes all output
+    channels directly, and is sized to match a given RoleMixer, so the only
+    difference between the arms is the structure.
+
+    Like RoleMixer it starts as a no-op, so both arms depart from an identical
+    baseline: the last convolution is zero-initialized, which leaves its own
+    gradient intact so the layer learns first and the rest follows.
+
+    Args:
+        in_channels (int): Channels in the fused input stack.
+        nout (int, optional): Output channel count of the base prediction.
+        width (int, optional): Hidden width.
+        depth (int, optional): Number of hidden convolutions.
+    """
+
+    def __init__(self, in_channels, nout=3, width=16, depth=2):
+        super().__init__()
+        if depth < 1:
+            raise ValueError("depth must be >= 1")
+        layers, c_in = [], int(in_channels)
+        for _ in range(depth):
+            layers += [nn.Conv2d(c_in, width, 3, padding=1),
+                       nn.GroupNorm(_groups(width), width),
+                       nn.GELU()]
+            c_in = width
+        self.head = nn.Conv2d(width, nout, 3, padding=1)
+        self.net = nn.Sequential(*layers)
+        with torch.no_grad():
+            self.head.weight.zero_()
+            self.head.bias.zero_()
+        self.nout = int(nout)
+        self.enabled = True
+
+    @staticmethod
+    def _param_count(in_channels, nout, width, depth):
+        total = 0
+        c_in = in_channels
+        for _ in range(depth):
+            total += c_in * width * 9 + width      # conv
+            total += 2 * width                     # group norm
+            c_in = width
+        total += width * nout * 9 + nout           # head
+        return total
+
+    @classmethod
+    def matched_to(cls, mixer, in_channels, nout=3, depth=2, max_width=512):
+        """Build one whose parameter count is as close as possible to ``mixer``.
+
+        Args:
+            mixer (nn.Module): The RoleMixer this arm is the control for.
+            in_channels (int): Channels in the fused input stack.
+            nout (int, optional): Output channel count.
+            depth (int, optional): Number of hidden convolutions.
+            max_width (int, optional): Largest width to consider.
+
+        Returns:
+            UnrestrictedCorrection: Sized to match, with its realized parameter
+            count recorded on ``matched_target`` and ``matched_error``.
+        """
+        target = sum(p.numel() for p in mixer.parameters())
+        best = min(range(1, max_width + 1),
+                   key=lambda w: abs(cls._param_count(in_channels, nout, w,
+                                                      depth) - target))
+        model = cls(in_channels, nout=nout, width=best, depth=depth)
+        realized = sum(p.numel() for p in model.parameters())
+        model.matched_target = int(target)
+        model.matched_error = int(realized - target)
+        roles_logger.info(
+            ">>> capacity-matched control: width=%d, %d parameters vs %d in the "
+            "mixer (%+d)", best, realized, target, realized - target)
+        return model
+
+    def forward(self, base, inputs):
+        if not self.enabled:
+            return base
+        if base.shape[-2:] != inputs.shape[-2:]:
+            raise ValueError(
+                f"corrections are added at full resolution, but base is "
+                f"{tuple(base.shape[-2:])} and inputs are "
+                f"{tuple(inputs.shape[-2:])}")
+        return base + self.head(self.net(inputs.to(base.dtype))).to(base.dtype)
+
+    def extra_repr(self):
+        return f"nout={self.nout}, enabled={self.enabled}"

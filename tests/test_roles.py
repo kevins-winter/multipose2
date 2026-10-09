@@ -395,3 +395,122 @@ def test_suppression_is_bounded_and_never_reaches_zero_probability():
     assert worst >= -coef * (SUPPRESS_GAIN + 0.1), "bounded by gain x coefficient"
     # a finite logit penalty is a finite odds ratio, never a probability of zero
     assert float(torch.exp(torch.tensor(worst))) > 0.
+
+
+# --- capacity-matched control ------------------------------------------------
+
+def test_control_is_sized_to_match_the_mixer():
+    from multipose2.roles import UnrestrictedCorrection
+    mixer = _mixer()
+    ctrl = UnrestrictedCorrection.matched_to(mixer, in_channels=5)
+    target = sum(p.numel() for p in mixer.parameters())
+    realized = sum(p.numel() for p in ctrl.parameters())
+    assert ctrl.matched_target == target
+    assert ctrl.matched_error == realized - target
+    # within a couple of percent, which is what makes the arms comparable
+    assert abs(realized - target) / target < 0.05
+
+
+def test_control_starts_as_an_exact_no_op_but_still_learns():
+    from multipose2.roles import UnrestrictedCorrection
+    ctrl = UnrestrictedCorrection(in_channels=5, width=12)
+    base, x = _base(), _inputs()
+    ctrl.eval()
+    with torch.no_grad():
+        assert torch.equal(ctrl(base, x), base), "both arms must start identical"
+    # a zero-initialised head keeps its own gradient, so the layer learns first
+    ctrl(base, x).square().mean().backward()
+    assert float(ctrl.head.weight.grad.abs().sum()) > 0
+
+
+def test_control_writes_every_output_channel_without_structure():
+    from multipose2.roles import UnrestrictedCorrection
+    ctrl = UnrestrictedCorrection(in_channels=5, width=12)
+    base, x = _base(), _inputs()
+    with torch.no_grad():
+        ctrl.head.weight.normal_(0., 0.2)
+        ctrl.head.bias.normal_(0., 0.2)
+        delta = ctrl(base, x) - base
+    # unlike the mixer, nothing confines it to one output or one sign
+    assert delta[:, -1:].abs().max() > 0
+    assert delta[:, -3:-1].abs().max() > 0
+    assert delta.min() < 0 < delta.max()
+
+
+def test_control_respects_enabled_and_resolution():
+    from multipose2.roles import UnrestrictedCorrection
+    ctrl = UnrestrictedCorrection(in_channels=5, width=12)
+    base, x = _base(), _inputs()
+    ctrl.enabled = False
+    with torch.no_grad():
+        assert torch.equal(ctrl(base, x), base)
+    ctrl.enabled = True
+    with pytest.raises(ValueError, match="full resolution"):
+        ctrl(_base(s=32), _inputs(s=64))
+
+
+def test_groups_divides_every_width():
+    from multipose2.roles import _groups, UnrestrictedCorrection
+    for w in range(1, 128):
+        assert w % _groups(w) == 0
+        UnrestrictedCorrection(in_channels=4, width=w, depth=1)
+
+
+def test_sparsity_penalty_skips_a_control_with_no_coefficients():
+    from multipose2 import train
+    from multipose2.roles import UnrestrictedCorrection
+    net = vit_sam.Transformer(in_channels=5, bsize=64)
+    net.set_role_mixer(UnrestrictedCorrection(in_channels=5, width=8))
+    train.set_trainable_parameters(net, trainable_mode="roles_only")
+    # no coefficient penalty applies; weight decay already covers its parameters
+    assert train._sparsity_penalty(net, 1., 0.) is None
+
+
+# --- availability versus observed-but-empty ---------------------------------
+
+def test_unavailable_and_observed_empty_are_different_statements():
+    """Zeroing values says "measured, saw nothing"; absence says "no channel"."""
+    mixer = _mixer(roles=("foreground_support",))
+    with torch.no_grad():
+        mixer.coefficients["uchl1__foreground_support"].fill_(1.0)
+    base, x = _base(), _inputs()
+    mixer.eval()
+    with torch.no_grad():
+        zeroed = x.clone()
+        zeroed[:, 3] = 0.
+        observed_empty = mixer(base, zeroed)
+        mixer.set_presence(torch.tensor([1., 0., 1.]))
+        unavailable = mixer(base, x)
+        mixer.set_presence(None)
+        restored = mixer(base, x)
+
+    assert not torch.allclose(observed_empty, base, atol=1e-6), \
+        "an observed channel reading zero is still evidence"
+    assert torch.equal(unavailable[:, -1:], base[:, -1:]), \
+        "an unavailable modality must contribute exactly nothing"
+    assert not torch.allclose(observed_empty, unavailable, atol=1e-6)
+    assert not torch.allclose(restored, base, atol=1e-6), "clearing must restore"
+
+
+def test_presence_shape_is_validated():
+    mixer = _mixer()
+    with pytest.raises(ValueError, match="must cover 3 modalities"):
+        mixer.set_presence(torch.tensor([1., 0.]))
+
+
+def test_modality_dropout_only_applies_in_training_mode():
+    mixer = _mixer(modality_dropout=0.9)
+    mixer.eval()
+    assert float(mixer._presence(32, torch.device("cpu"), torch.float32).mean()) == 1.0
+    mixer.train()
+    mask = mixer._presence(256, torch.device("cpu"), torch.float32)
+    assert 0. < float(mask.mean()) < 1.
+    # never drop every modality at once, which would supervise nothing
+    assert bool(mask.any(dim=1).all())
+
+
+def test_invalid_modality_dropout_is_rejected():
+    with pytest.raises(ValueError, match="modality_dropout must be"):
+        _mixer(modality_dropout=1.0)
+    with pytest.raises(ValueError, match="modality_dropout must be"):
+        _mixer(modality_dropout=-0.1)

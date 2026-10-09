@@ -261,8 +261,10 @@ def _sparsity_penalty(net, role_l1=0., adapter_l1=0.):
     """
     terms = []
     mixer = getattr(net, "role_mixer", None)
-    if role_l1 and mixer is not None and any(p.requires_grad
-                                             for p in mixer.parameters()):
+    # the capacity-matched control has no coefficients, so no coefficient
+    # penalty applies to it; weight decay already covers its parameters
+    if (role_l1 and mixer is not None and hasattr(mixer, "l1")
+            and any(p.requires_grad for p in mixer.parameters())):
         terms.append(role_l1 * mixer.l1())
     adapter = getattr(net, "input_adapter", None)
     if (adapter_l1 and adapter is not None and hasattr(adapter, "channel_l1")
