@@ -29,6 +29,25 @@ class LinearInputAdapter(nn.Module):
             for c in range(ncopy):
                 self.proj.weight[c, c, 0, 0] = 1.0
 
+    def channel_norms(self):
+        """L2 norm of each input channel's contribution, as a 1-D tensor.
+
+        The adapter maps C channels into the trunk's 3, so these norms are how
+        much trunk bandwidth each channel was allocated. At identity init the
+        first three are 1 and the rest are 0.
+        """
+        return self.proj.weight.flatten(2).squeeze(-1).norm(dim=0)
+
+    def channel_l1(self):
+        """Group lasso over input channels: sum of their L2 norms.
+
+        Element-wise L1 would sparsify individual weights, which says nothing
+        useful. Penalizing each channel's norm as a group drives whole channels
+        to zero, so the surviving ones are a readable statement about which
+        modalities earned a place in the trunk input.
+        """
+        return self.channel_norms().sum()
+
     def forward(self, x):
         return self.proj(x)
 
@@ -54,6 +73,14 @@ class MSCALiteInputAdapter(nn.Module):
             nn.Sigmoid(),
         )
         self.out = nn.Conv2d(hidden_channels * 3, 3, kernel_size=1)
+
+    def channel_norms(self):
+        """L2 norm of each input channel's contribution through the stem."""
+        return self.stem.weight.flatten(2).squeeze(-1).norm(dim=0)
+
+    def channel_l1(self):
+        """Group lasso over input channels; see LinearInputAdapter.channel_l1."""
+        return self.channel_norms().sum()
 
     def forward(self, x):
         x = F.relu(self.stem(x), inplace=True)

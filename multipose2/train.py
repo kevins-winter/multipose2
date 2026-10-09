@@ -252,6 +252,30 @@ def _last_encoder_block_prefixes(net, n_trainable_blocks):
     return [f"encoder.blocks.{i}." for i in range(start, n_blocks)]
 
 
+def _sparsity_penalty(net, role_l1=0., adapter_l1=0.):
+    """L1 terms that keep the interpretable parameters readable.
+
+    Returns None when both weights are zero, so the default path adds nothing.
+    Only parameters that are currently trainable contribute: penalizing a frozen
+    group would add a constant to the loss and shrink nothing.
+    """
+    terms = []
+    mixer = getattr(net, "role_mixer", None)
+    if role_l1 and mixer is not None and any(p.requires_grad
+                                             for p in mixer.parameters()):
+        terms.append(role_l1 * mixer.l1())
+    adapter = getattr(net, "input_adapter", None)
+    if (adapter_l1 and adapter is not None and hasattr(adapter, "channel_l1")
+            and any(p.requires_grad for p in adapter.parameters())):
+        terms.append(adapter_l1 * adapter.channel_l1())
+    if not terms:
+        return None
+    total = terms[0]
+    for term in terms[1:]:
+        total = total + term
+    return total
+
+
 def _is_never_trainable(name):
     """Parameters the architecture declares with requires_grad=False.
 
@@ -267,7 +291,7 @@ def set_trainable_parameters(net, trainable_mode="all", n_trainable_blocks=2):
     """Select which network parameters are optimized during segmentation training."""
     valid_modes = {
         "all", "adapter_head", "adapter_head_last_blocks", "adapter_only",
-        "head_only",
+        "head_only", "roles_only", "roles_head", "adapter_roles_head",
     }
     if trainable_mode not in valid_modes:
         raise ValueError(
@@ -288,10 +312,14 @@ def set_trainable_parameters(net, trainable_mode="all", n_trainable_blocks=2):
         return
 
     prefixes = []
-    if trainable_mode in {"adapter_head", "adapter_head_last_blocks", "adapter_only"}:
+    if trainable_mode in {"adapter_head", "adapter_head_last_blocks",
+                          "adapter_only", "adapter_roles_head"}:
         prefixes.append("input_adapter.")
-    if trainable_mode in {"adapter_head", "adapter_head_last_blocks", "head_only"}:
+    if trainable_mode in {"adapter_head", "adapter_head_last_blocks", "head_only",
+                          "roles_head", "adapter_roles_head"}:
         prefixes.append("out.")
+    if trainable_mode in {"roles_only", "roles_head", "adapter_roles_head"}:
+        prefixes.append("role_mixer.")
     if trainable_mode == "adapter_head_last_blocks":
         prefixes.extend(_last_encoder_block_prefixes(net, n_trainable_blocks))
         prefixes.append("encoder.neck.")
@@ -784,7 +812,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               trainable_mode="all", n_trainable_blocks=2, warmup_epochs=10,
               training_stages=None, resume=False, resume_every=0,
               resume_path=None, timing=True, timing_path=None,
-              amp_dtype="auto"):
+              amp_dtype="auto", role_l1=0., adapter_l1=0.):
     """
     Train the network with images for segmentation.
 
@@ -816,7 +844,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         rescale (bool, optional): Boolean - whether or not to rescale images during training. Defaults to False.
         min_train_masks (int, optional): Integer - minimum number of masks an image must have to use in the training set. Defaults to 5.
         model_name (str, optional): String - name of the network. Defaults to None.
-        trainable_mode (str, optional): Which parameters to optimize. Use "all" for full fine-tuning, "adapter_head" for the input adapter and output head, "adapter_head_last_blocks" for the input adapter, output head, encoder neck, and the final SAM encoder blocks, "adapter_only" for only the input adapter, or "head_only" for only the output head. Defaults to "all".
+        trainable_mode (str, optional): Which parameters to optimize. Use "all" for full fine-tuning, "adapter_head" for the input adapter and output head, "adapter_head_last_blocks" to add the encoder neck and the final SAM encoder blocks, "adapter_only" or "head_only" for one of those alone, "roles_only" for just the role mixer, "roles_head" for the role mixer and output head, or "adapter_roles_head" for all three. Defaults to "all".
         n_trainable_blocks (int, optional): Number of final SAM encoder blocks to train when trainable_mode="adapter_head_last_blocks". Defaults to 2.
         warmup_epochs (int, optional): Number of epochs used to ramp the learning rate from 0 to learning_rate for non-staged training. Defaults to 10.
         training_stages (list of dict, optional): Continuous staged training schedule. Each stage can define "name", "trainable_mode", "n_epochs", "learning_rate", "n_trainable_blocks", "warmup_epochs", and "decay_schedule". Preprocessing runs once, then optimizer/trainable parameters are rebuilt at stage boundaries.
@@ -826,6 +854,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         timing (bool, optional): Log per-epoch wall time broken down into batch assembly, augmentation, the GPU step, validation and checkpointing, and append one JSON line per epoch to timing_path. The breakdown adds no CUDA synchronisation of its own, because loss.item() already synchronises at the end of each step. Defaults to True.
         timing_path (str or Path, optional): Where per-epoch timing records are appended as JSON lines. Defaults to save_path/models/<model_name>_timing.jsonl.
         amp_dtype (str or torch.dtype, optional): Autocast dtype for the forward pass, independent of the float32 master weights. "auto" picks bfloat16 on a GPU that supports it, float16 with gradient scaling otherwise, and bfloat16 on CPU. Pass "bfloat16"/"float16" to force one, or None/"float32" to train in full float32. Defaults to "auto".
+        role_l1 (float, optional): Weight on the sum of the role mixer's coefficient magnitudes. Without it a modality spreads itself thinly over every role and the coefficient table stops being readable; the prior that a marker does one or two things is both correct and what makes the result interpretable. Defaults to 0.
+        adapter_l1 (float, optional): Weight on a group lasso over the input adapter's channels, which drives whole channels to zero so that the surviving ones state which modalities earned trunk bandwidth. Defaults to 0.
 
     Returns:
         tuple: A tuple containing the path to the saved model weights, training losses, and test losses.
@@ -1046,6 +1076,11 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                         if y.shape[1] > 3:
                             loss3 = _loss_fn_class(lbl, y, class_weights=class_weights)
                             loss += loss3
+                    # penalties act on parameters rather than activations, so
+                    # they stay outside autocast and in float32
+                    penalty = _sparsity_penalty(net, role_l1, adapter_l1)
+                    if penalty is not None:
+                        loss = loss + penalty
                     optimizer.zero_grad()
                     if scaler is not None:
                         scaler.scale(loss).backward()
