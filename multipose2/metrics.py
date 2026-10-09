@@ -148,6 +148,66 @@ def average_precision(masks_true, masks_pred, threshold=[0.5, 0.75, 0.9]):
     return ap, tp, fp, fn
 
 
+F1_THRESHOLDS = np.arange(0.5, 1.0, 0.05)
+
+
+def pooled_f1(masks_true, masks_pred, threshold=None):
+    """Precision, recall and F1 pooled over a dataset, per IoU threshold.
+
+    average_precision() returns a score per image, and averaging those
+    over-weights images that hold one or two cells while scoring an image with
+    no true and no predicted masks as a perfect 1.0. On a test set that is
+    largely background, the mean is then dominated by blank images rather than
+    by segmentation quality.
+
+    Pooling true positives, false positives and false negatives across the whole
+    dataset before dividing avoids both problems: every cell counts once
+    regardless of which image it came from, and a spurious mask on a blank image
+    counts as a false positive instead of zeroing that image's score.
+
+    Note also that average_precision() computes TP/(TP+FP+FN), which is a
+    Jaccard-style score rather than F1. F1 is 2TP/(2TP+FP+FN); the two are not
+    interchangeable.
+
+    Args:
+        masks_true (list of ndarray): Ground-truth label images.
+        masks_pred (list of ndarray): Predicted label images.
+        threshold (array-like, optional): IoU thresholds for matching. Defaults
+            to F1_THRESHOLDS, i.e. 0.50 to 0.95 in steps of 0.05.
+
+    Returns:
+        dict: ``threshold``, pooled ``tp``/``fp``/``fn``, ``precision``,
+        ``recall`` and ``f1`` arrays over thresholds, plus the scalars ``f1_50``
+        (at the threshold nearest 0.5), ``f1_50_95`` (mean over thresholds in
+        [0.5, 0.95]), and the dataset totals ``n_true`` and ``n_pred``.
+    """
+    threshold = F1_THRESHOLDS if threshold is None else np.atleast_1d(threshold)
+    threshold = np.asarray(threshold, dtype=float)
+
+    _, tp, fp, fn = average_precision(masks_true, masks_pred,
+                                      threshold=list(threshold))
+    tp, fp, fn = np.atleast_2d(tp), np.atleast_2d(fp), np.atleast_2d(fn)
+    TP, FP, FN = tp.sum(axis=0), fp.sum(axis=0), fn.sum(axis=0)
+
+    def _safe(num, den):
+        return np.divide(num, den, where=den > 0,
+                         out=np.zeros(den.shape, dtype=np.float64))
+
+    f1 = _safe(2. * TP, 2. * TP + FP + FN)
+    in_range = (threshold >= 0.5) & (threshold <= 0.95)
+    return {
+        "threshold": threshold,
+        "tp": TP, "fp": FP, "fn": FN,
+        "precision": _safe(TP, TP + FP),
+        "recall": _safe(TP, TP + FN),
+        "f1": f1,
+        "f1_50": float(f1[int(np.argmin(np.abs(threshold - 0.5)))]),
+        "f1_50_95": float(f1[in_range].mean()) if in_range.any() else None,
+        "n_true": int(TP[0] + FN[0]),
+        "n_pred": int(TP[0] + FP[0]),
+    }
+
+
 def _intersection_over_union(masks_true, masks_pred):
     """Calculate the intersection over union of all mask pairs.
 
