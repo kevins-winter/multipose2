@@ -1,0 +1,15 @@
+# Build requirements are declared here so that pip installs them as wheels into
+# an isolated build environment.
+#
+# Without this file, setuptools falls back to the setup_requires key in
+# setup.py, which is handled by the deprecated fetch_build_eggs path: it builds
+# Python-version-specific eggs at build time, resolved from the source rather
+# than from wheels. That path works only where a compatible egg is already
+# cached, so it succeeds on a developer machine that has built before and fails
+# on a clean one -- notably Google Colab, where "pip install git+..." reports
+# "python setup.py egg_info did not run successfully".
+#
+# Package metadata still lives in setup.py; this file only declares how to build.
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"

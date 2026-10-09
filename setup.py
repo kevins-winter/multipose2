@@ -85,10 +85,12 @@ setup(
     author_email="stringerc@janelia.hhmi.org",
     description="anatomical segmentation algorithm", long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/kevins-winter/multipose2", setup_requires=[
-        'pytest-runner',
-        'setuptools_scm',
-    ], packages=setuptools.find_packages(), use_scm_version=True,
+    url="https://github.com/kevins-winter/multipose2",
+    # Build requirements are declared in pyproject.toml. setup_requires would
+    # send setuptools down the deprecated fetch_build_eggs path instead, which
+    # fails on a machine with no matching egg cache. pytest-runner is dropped
+    # entirely: nothing here uses it, and tox installs pytest directly.
+    packages=setuptools.find_packages(), use_scm_version=True,
     install_requires=install_deps, tests_require=['pytest'], extras_require={
         'docs': docs_deps,
         'gui': gui_deps,
