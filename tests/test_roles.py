@@ -41,11 +41,11 @@ def test_disabled_mixer_is_exactly_a_no_op():
         assert torch.equal(mixer(base, x), base)
 
 
-def test_veto_can_only_subtract_from_cell_probability():
+def test_foreground_suppress_can_only_subtract_from_cell_probability():
     """Necessity, which an additive mixture cannot express."""
-    mixer = _mixer(roles=("veto",))
+    mixer = _mixer(roles=("foreground_suppress",))
     with torch.no_grad():
-        mixer.coefficients["uchl1__veto"].fill_(2.0)  # softplus(2) ~ 2.13
+        mixer.coefficients["uchl1__foreground_suppress"].fill_(2.0)  # softplus(2) ~ 2.13
         base, x = _base(), _inputs()
         out = mixer(base, x)
     delta = (out - base)[:, -1:]
@@ -55,19 +55,52 @@ def test_veto_can_only_subtract_from_cell_probability():
     assert torch.allclose(out[:, -3:-1], base[:, -3:-1])
 
 
-def test_support_is_signed_and_touches_only_cell_probability():
-    mixer = _mixer(roles=("support",))
+def test_foreground_support_direction_lives_in_the_coefficient():
+    """The sigmoid branch puts the sign in the coefficient, not the pattern.
+
+    A tanh branch would let one modality raise the logit in one place and lower
+    it in another: more flexible, but it makes the coefficient's sign
+    meaningless, because negating both coefficient and branch gives identical
+    output.
+    """
+    mixer = _mixer(roles=("foreground_support",))
+    base, x = _base(), _inputs()
     with torch.no_grad():
-        mixer.coefficients["uchl1__support"].fill_(1.0)
-        base, x = _base(), _inputs()
+        mixer.coefficients["uchl1__foreground_support"].fill_(1.0)
+        positive = (mixer(base, x) - base)[:, -1:].clone()
+        mixer.coefficients["uchl1__foreground_support"].fill_(-1.0)
+        negative = (mixer(base, x) - base)[:, -1:].clone()
         out = mixer(base, x)
-    delta = (out - base)[:, -1:]
-    assert delta.max() > 0 and delta.min() < 0, "support must be able to add or subtract"
+    assert (positive >= -1e-6).all(), "a positive coefficient must only add"
+    assert (negative <= 1e-6).all(), "a negative coefficient must only subtract"
+    assert float(positive.max()) > 1e-3
+    assert torch.allclose(positive, -negative, atol=1e-6)
     assert torch.allclose(out[:, -3:-1], base[:, -3:-1])
 
 
-def test_potential_and_edge_touch_only_the_flow_field():
-    for role in ("potential", "edge"):
+def test_sign_degeneracy_is_closed_for_signed_roles():
+    """Negating coefficient and branch together must now change the output.
+
+    With a tanh branch it did not -- the two were bit-identical, so the sign of
+    a flow_center coefficient carried no information about attraction versus
+    repulsion. A sigmoid branch removes that symmetry.
+    """
+    for role in ("foreground_support", "flow_center"):
+        mixer = _mixer(roles=(role,))
+        base, x = _base(), _inputs()
+        with torch.no_grad():
+            mixer.coefficients[f"uchl1__{role}"].fill_(1.0)
+            before = mixer(base, x).clone()
+            mixer.coefficients[f"uchl1__{role}"].fill_(-1.0)
+            for prm in mixer.branches[f"uchl1__{role}"].parameters():
+                prm.mul_(-1.0)
+            after = mixer(base, x).clone()
+        assert not torch.allclose(before, after, atol=1e-5), (
+            f"{role}: sign degeneracy is still present")
+
+
+def test_flow_center_and_flow_refine_touch_only_the_flow_field():
+    for role in ("flow_center", "flow_refine"):
         mixer = _mixer(roles=(role,))
         with torch.no_grad():
             mixer.coefficients[f"fabp7__{role}"].fill_(1.5)
@@ -77,14 +110,14 @@ def test_potential_and_edge_touch_only_the_flow_field():
         assert torch.allclose(out[:, -1:], base[:, -1:]), role
 
 
-def test_potential_sign_flips_the_flow_direction():
+def test_flow_center_sign_flips_the_flow_direction():
     """A positive coefficient attracts, a negative one repels."""
-    mixer = _mixer(roles=("potential",))
+    mixer = _mixer(roles=("flow_center",))
     base, x = _base(), _inputs()
     with torch.no_grad():
-        mixer.coefficients["uchl1__potential"].fill_(1.0)
+        mixer.coefficients["uchl1__flow_center"].fill_(1.0)
         attract = mixer(base, x) - base
-        mixer.coefficients["uchl1__potential"].fill_(-1.0)
+        mixer.coefficients["uchl1__flow_center"].fill_(-1.0)
         repel = mixer(base, x) - base
     assert torch.allclose(attract[:, -3:-1], -repel[:, -3:-1], atol=1e-5)
 
@@ -104,28 +137,28 @@ def test_coefficients_receive_gradient_from_a_zero_start():
 def test_coefficient_table_reports_constrained_and_signed_roles():
     mixer = _mixer()
     with torch.no_grad():
-        mixer.coefficients["uchl1__veto"].fill_(3.0)
-        mixer.coefficients["fabp7__potential"].fill_(-2.0)
+        mixer.coefficients["uchl1__foreground_suppress"].fill_(3.0)
+        mixer.coefficients["fabp7__flow_center"].fill_(-2.0)
     table = mixer.coefficient_table()
     assert set(table) == {"he", "uchl1", "fabp7"}
-    assert table["uchl1"]["veto"] == pytest.approx(torch.nn.functional.softplus(
+    assert table["uchl1"]["foreground_suppress"] == pytest.approx(torch.nn.functional.softplus(
         torch.tensor(3.0)).item())
-    assert table["fabp7"]["potential"] == pytest.approx(-2.0)
+    assert table["fabp7"]["flow_center"] == pytest.approx(-2.0)
     # non-negative roles can never report a negative value
-    assert all(t["veto"] >= 0 and t["edge"] >= 0 for t in table.values())
+    assert all(t["foreground_suppress"] >= 0 and t["flow_refine"] >= 0 for t in table.values())
 
 
 def test_l1_is_zero_ish_at_init_and_grows_with_use():
     mixer = _mixer()
     start = float(mixer.l1().detach())
     with torch.no_grad():
-        mixer.coefficients["he__support"].fill_(4.0)
+        mixer.coefficients["he__foreground_support"].fill_(4.0)
     assert float(mixer.l1().detach()) > start + 3.9
 
 
 def test_unknown_role_is_rejected():
     with pytest.raises(ValueError, match="unknown roles"):
-        RoleMixer(MODALITIES, roles=("veto", "vibes"))
+        RoleMixer(MODALITIES, roles=("foreground_suppress", "vibes"))
     with pytest.raises(ValueError, match="at least one role"):
         RoleMixer(MODALITIES, roles=())
 
@@ -167,14 +200,14 @@ def test_coefficient_is_the_only_carrier_of_scale():
     the branch grows to compensate. Squashing the branch to [-1, 1] bounds each
     term by its coefficient, so the table reports real magnitudes.
     """
-    for role, bound in (("support", 1.0), ("edge", 1.0)):
+    for role, bound in (("foreground_support", 1.0), ("flow_refine", 1.0)):
         mixer = _mixer(roles=(role,))
         base, x = _base(), _inputs()
         with torch.no_grad():
-            if role in ("veto", "edge"):
+            if role in ("foreground_suppress", "flow_refine"):
                 mixer.coefficients[f"uchl1__{role}"].fill_(-10.0)  # ~0
             coef = 0.5
-            raw = torch.log(torch.expm1(torch.tensor(coef))) if role == "edge" \
+            raw = torch.log(torch.expm1(torch.tensor(coef))) if role == "flow_refine" \
                 else torch.tensor(coef)
             mixer.coefficients[f"uchl1__{role}"].copy_(raw)
             small = (mixer(base, x) - base).abs().max()
@@ -188,18 +221,18 @@ def test_coefficient_is_the_only_carrier_of_scale():
         assert small <= effective * bound + 1e-4
 
 
-def test_veto_magnitude_is_bounded_by_gain_times_coefficient():
-    from multipose2.roles import VETO_GAIN
-    mixer = _mixer(roles=("veto",))
+def test_foreground_suppress_magnitude_is_bounded_by_gain_times_coefficient():
+    from multipose2.roles import SUPPRESS_GAIN
+    mixer = _mixer(roles=("foreground_suppress",))
     base, x = _base(), _inputs()
     with torch.no_grad():
-        mixer.coefficients["uchl1__veto"].fill_(2.0)
-        for prm in mixer.branches["uchl1__veto"].parameters():
+        mixer.coefficients["uchl1__foreground_suppress"].fill_(2.0)
+        for prm in mixer.branches["uchl1__foreground_suppress"].parameters():
             prm.mul_(100.0)
         delta = (mixer(base, x) - base)[:, -1:]
-    coef = float(mixer.coefficient("uchl1", "veto").detach())
+    coef = float(mixer.coefficient("uchl1", "foreground_suppress").detach())
     assert (delta <= 1e-6).all()
-    assert delta.abs().max() <= coef * (VETO_GAIN + 0.1)
+    assert delta.abs().max() <= coef * (SUPPRESS_GAIN + 0.1)
 
 
 # --- trainable modes and sparsity penalties ---------------------------------
@@ -300,3 +333,65 @@ def test_sparsity_penalty_sums_both_terms_when_both_are_trainable():
     # and the weights scale independently
     scaled = float(train._sparsity_penalty(net, 2., 0.).detach())
     assert scaled == pytest.approx(2 * float(net.role_mixer.l1().detach()))
+
+
+def test_contribution_report_measures_what_forward_applies():
+    """Effect size, not coefficients: the quantity worth reporting."""
+    mixer = _mixer()
+    x = _inputs()
+    with torch.no_grad():
+        mixer.coefficients["uchl1__foreground_support"].fill_(1.5)
+        report = mixer.contribution_report(x)
+
+    assert set(report) == {"he", "uchl1", "fabp7"}
+    assert set(report["uchl1"]) == set(mixer.roles)
+    entry = report["uchl1"]["foreground_support"]
+    assert entry["target"] == "cellprob"
+    assert 0. < entry["mean_abs"] <= entry["max_abs"]
+    assert 0. <= entry["frac_active"] <= 1.
+    # a flow_center term is differentiated before measuring, so it is reported
+    # against the output it actually corrects
+    assert report["uchl1"]["flow_center"]["target"] == "flows"
+    assert report["uchl1"]["flow_refine"]["target"] == "flows"
+    assert report["uchl1"]["foreground_suppress"]["target"] == "cellprob"
+
+
+def test_contribution_report_separates_terms_a_coefficient_cannot():
+    """Two branches sharing a coefficient can differ hugely in total influence.
+
+    This is why the coefficient is a diagnostic and the measured contribution is
+    the reportable number.
+    """
+    mixer = _mixer(roles=("foreground_support",))
+    x = _inputs()
+    with torch.no_grad():
+        mixer.coefficients["uchl1__foreground_support"].fill_(1.0)
+        last = mixer.branches["uchl1__foreground_support"].net[-1]
+        last.weight.mul_(0.)
+        last.bias.fill_(-8.0)          # sigmoid ~ 0, barely acts
+        quiet = mixer.contribution_report(x)["uchl1"]["foreground_support"]
+        last.bias.fill_(8.0)           # sigmoid ~ 1, acts everywhere
+        loud = mixer.contribution_report(x)["uchl1"]["foreground_support"]
+
+    coef = float(mixer.coefficient("uchl1", "foreground_support").detach())
+    assert coef == pytest.approx(1.0)
+    assert loud["mean_abs"] > 100 * quiet["mean_abs"], (
+        "the report must distinguish what one coefficient cannot")
+
+
+def test_suppression_is_bounded_and_never_reaches_zero_probability():
+    """Suppression multiplies the odds; it is not a logical gate."""
+    from multipose2.roles import SUPPRESS_GAIN
+    mixer = _mixer(roles=("foreground_suppress",))
+    base, x = _base(), _inputs()
+    with torch.no_grad():
+        mixer.coefficients["uchl1__foreground_suppress"].fill_(2.0)
+        for prm in mixer.branches["uchl1__foreground_suppress"].parameters():
+            prm.mul_(1000.0)
+        delta = (mixer(base, x) - base)[:, -1:]
+    coef = float(mixer.coefficient("uchl1", "foreground_suppress").detach())
+    assert (delta <= 1e-6).all(), "suppression must never add foreground evidence"
+    worst = float(delta.min())
+    assert worst >= -coef * (SUPPRESS_GAIN + 0.1), "bounded by gain x coefficient"
+    # a finite logit penalty is a finite odds ratio, never a probability of zero
+    assert float(torch.exp(torch.tensor(worst))) > 0.
