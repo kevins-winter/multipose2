@@ -514,3 +514,196 @@ def test_invalid_modality_dropout_is_rejected():
         _mixer(modality_dropout=1.0)
     with pytest.raises(ValueError, match="modality_dropout must be"):
         _mixer(modality_dropout=-0.1)
+
+
+# --- receptive field, context conditioning, and interactions ----------------
+
+CORR_MODS = [("he", (0, 1, 2)), ("uchl1", (3,)), ("fabp7", (4,))]
+
+
+def _corr(**kw):
+    from multipose2.roles import ModalityCorrections
+    torch.manual_seed(0)
+    return ModalityCorrections(CORR_MODS, nout=3, **kw).eval()
+
+
+def _ctx(n=2, d=256, s=8):
+    torch.manual_seed(3)
+    return torch.randn(n, d, s, s)
+
+
+def _saturate(m, value=1.5):
+    with torch.no_grad():
+        for key in m.coefficients:
+            m.coefficients[key].fill_(value)
+    return m
+
+
+def test_branch_receptive_field_covers_a_soma():
+    """Two 3x3 convolutions see 5 pixels; a soma spans tens."""
+    from multipose2.roles import MultiscaleBranch
+    narrow = MultiscaleBranch(3, 8, width=8, dilations=(1, 1))
+    assert narrow.receptive_field == 5
+    wide = MultiscaleBranch(3, 8, width=8)
+    assert wide.receptive_field == 63
+    # and the width comes nearly free, because the stack is depthwise-separable
+    assert sum(p.numel() for p in wide.parameters()) < 4000
+
+
+def test_independent_arm_is_exactly_additive_across_modalities():
+    """Arm 1: a modality's correction does not depend on the others."""
+    m = _saturate(_corr())
+    base, x = _base(s=64), _inputs(c=5, s=64)
+
+    def delta(on):
+        m.set_presence(torch.tensor([1. if n in on else 0.
+                                     for n in m.modality_names]))
+        with torch.no_grad():
+            out = (m(base, x) - base).clone()
+        m.set_presence(None)
+        return out
+
+    he, tx, both = delta({"he"}), delta({"uchl1"}), delta({"he", "uchl1"})
+    assert torch.allclose(both, he + tx, atol=1e-5)
+    # masking features alone would leak the route head's bias, so the term is
+    # masked too and an absent modality contributes exactly nothing
+    assert torch.allclose(delta({"he"}), he, atol=1e-6)
+
+
+def test_cross_modality_arm_is_not_additive():
+    """Arm 3 exists to express conjunctions, so it must break additivity."""
+    m = _saturate(_corr(context_dim=256, cross_modality=True))
+    base, x, ctx = _base(s=64), _inputs(c=5, s=64), _ctx()
+
+    def delta(on):
+        m.set_presence(torch.tensor([1. if n in on else 0.
+                                     for n in m.modality_names]))
+        with torch.no_grad():
+            out = (m(base, x, context=ctx) - base).clone()
+        m.set_presence(None)
+        return out
+
+    he, tx, both = delta({"he"}), delta({"uchl1"}), delta({"he", "uchl1"})
+    assert not torch.allclose(both, he + tx, atol=1e-4)
+    # attribution is given up in exchange, so there is one entry, not three
+    assert list(m.coefficient_table()) == ["mixed"]
+
+
+def test_context_changes_the_correction_only_when_conditioned():
+    m = _saturate(_corr(context_dim=256))
+    base, x = _base(s=64), _inputs(c=5, s=64)
+    with torch.no_grad():
+        # FiLM is zero-initialised, so context has no effect until it trains
+        same = (m(base, x, context=_ctx()) - base)
+        other = (m(base, x, context=torch.randn_like(_ctx())) - base)
+        assert torch.allclose(same, other, atol=1e-6)
+        for film in m.context_film.values():
+            film.weight.normal_(0., 0.3)
+            film.bias.normal_(0., 0.1)
+        a = (m(base, x, context=_ctx()) - base).clone()
+        b = (m(base, x, context=torch.randn_like(_ctx())) - base).clone()
+    assert not torch.allclose(a, b, atol=1e-5)
+
+    plain = _corr()
+    assert plain.context_dim is None
+
+
+def test_conditioned_module_requires_context():
+    m = _corr(context_dim=256)
+    with pytest.raises(ValueError, match="needs the frozen"):
+        m(_base(s=64), _inputs(c=5, s=64))
+
+
+def test_all_three_arms_start_as_no_ops():
+    base, x, ctx = _base(s=64), _inputs(c=5, s=64), _ctx()
+    for kw in ({}, {"context_dim": 256}, {"context_dim": 256, "cross_modality": True}):
+        m = _corr(**kw)
+        with torch.no_grad():
+            out = m(base, x, context=ctx if kw.get("context_dim") else None)
+        assert torch.allclose(out, base, atol=1e-6), kw
+        m.enabled = False
+        with torch.no_grad():
+            assert torch.equal(m(base, x, context=ctx if kw.get("context_dim") else None), base)
+
+
+def test_foreground_constraints_behave_as_documented():
+    base, x = _base(s=64), _inputs(c=5, s=64)
+
+    only_down = _saturate(_corr(foreground_constraint="suppress_only"))
+    with torch.no_grad():
+        d = (only_down(base, x) - base)[:, -1:]
+    assert (d <= 1e-6).all() and d.min() < -1e-3
+
+    both_ways = _saturate(_corr(foreground_constraint="none"))
+    with torch.no_grad():
+        d = (both_ways(base, x) - base)[:, -1:]
+    assert d.max() > 0 > d.min(), "the default must be able to raise and lower"
+
+    signed = _corr(foreground_constraint="sign_identifiable")
+    with torch.no_grad():
+        signed.coefficients["he__foreground"].fill_(1.0)
+        up = (signed(base, x) - base)[:, -1:].clone()
+        signed.coefficients["he__foreground"].fill_(-1.0)
+        down = (signed(base, x) - base)[:, -1:].clone()
+    assert (up >= -1e-6).all() and (down <= 1e-6).all()
+
+
+def test_flow_parameterizations_both_move_only_the_flows():
+    base, x = _base(s=64), _inputs(c=5, s=64)
+    for param in ("direct", "potential"):
+        m = _saturate(_corr(flow_parameterization=param))
+        with torch.no_grad():
+            out = m(base, x)
+        assert not torch.allclose(out[:, -3:-1], base[:, -3:-1], atol=1e-4), param
+
+
+def test_invalid_configuration_is_rejected():
+    with pytest.raises(ValueError, match="foreground_constraint must be"):
+        _corr(foreground_constraint="hinge")
+    with pytest.raises(ValueError, match="flow_parameterization must be"):
+        _corr(flow_parameterization="curl")
+
+
+def test_corrections_attach_to_the_transformer_and_receive_context():
+    from multipose2 import train
+    net = vit_sam.Transformer(in_channels=5, bsize=64)
+    net.set_role_mixer(_corr(context_dim=256))
+    train.set_trainable_parameters(net, trainable_mode="roles_only")
+    names = [n for n, p in net.named_parameters() if p.requires_grad]
+    assert names and all(n.startswith("role_mixer.") for n in names)
+    net.eval()
+    with torch.no_grad():
+        y = net(torch.randn(1, 5, 64, 64))[0]
+    assert y.shape == (1, 3, 64, 64)
+
+
+def test_control_matches_the_new_corrections_too():
+    from multipose2.roles import UnrestrictedCorrection
+    m = _corr(context_dim=256)
+    ctrl = UnrestrictedCorrection.matched_to(m, in_channels=5)
+    target = sum(p.numel() for p in m.parameters())
+    realized = sum(p.numel() for p in ctrl.parameters())
+    assert abs(realized - target) / target < 0.05
+
+
+def test_stochastic_depth_follows_encoder_trainability():
+    from multipose2 import train
+    net = vit_sam.Transformer(in_channels=5, bsize=64)
+    net.set_role_mixer(_corr())
+    x = torch.randn(1, 5, 64, 64)
+
+    train.set_trainable_parameters(net, trainable_mode="roles_only")
+    assert net.deterministic_trunk is True
+    net.train()
+    with torch.no_grad():
+        a = net.forward_trunk(net.input_adapter(x))
+        b = net.forward_trunk(net.input_adapter(x))
+    assert torch.allclose(a, b, atol=1e-6), "a frozen base must be reproducible"
+
+    train.set_trainable_parameters(net, trainable_mode="all")
+    assert net.deterministic_trunk is False
+    net.train()
+    with torch.no_grad():
+        a = net.forward_trunk(net.input_adapter(x))
+        b = net.forward_trunk(net.input_adapter(x))
+    assert not torch.allclose(a, b, atol=1e-6), "layer dropping should resume"

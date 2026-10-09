@@ -142,6 +142,10 @@ class Transformer(nn.Module):
         for blk in self.encoder.blocks:
             blk.window_size = 0
 
+        # stochastic depth is skipped while this is True; see
+        # set_deterministic_trunk()
+        self.deterministic_trunk = False
+
         self._dtype = dtype
         if dtype != torch.float32:
             self.dtype = dtype
@@ -192,7 +196,12 @@ class Transformer(nn.Module):
         if self.encoder.pos_embed is not None:
             x = x + self.encoder.pos_embed
 
-        if self.training and self.rdrop > 0:
+        # Stochastic depth makes the trunk non-deterministic, which is pointless
+        # noise once the encoder is frozen -- the trainable parameters are not
+        # being regularized by it -- and it defeats caching a frozen base, since
+        # the same input gives a different prediction every step.
+        if (self.training and self.rdrop > 0
+                and not getattr(self, "deterministic_trunk", False)):
             nlay = len(self.encoder.blocks)
             rdrop = (torch.rand((len(x), nlay), device=x.device) <
                      torch.linspace(0, self.rdrop, nlay, device=x.device)).to(x.dtype)
@@ -218,6 +227,17 @@ class Transformer(nn.Module):
         x1 = self.out(feat)
         return F.conv_transpose2d(x1, self.W2, stride = self.ps, padding = 0)
 
+    def set_deterministic_trunk(self, deterministic=True):
+        """Skip stochastic depth, so the same input always gives the same features.
+
+        Required before a frozen base prediction can be cached, and harmless
+        whenever the encoder is frozen: layer dropping on frozen weights
+        regularizes nothing and only adds variance for the trainable parts to
+        average out.
+        """
+        self.deterministic_trunk = bool(deterministic)
+        return self
+
     def set_role_mixer(self, role_mixer):
         """Attach a RoleMixer, or None to remove one.
 
@@ -234,9 +254,10 @@ class Transformer(nn.Module):
         feat = self.forward_trunk(self.input_adapter(x))
         x1 = self.forward_head(feat)
         if getattr(self, "role_mixer", None) is not None:
-            # role terms read the raw modality channels rather than trunk
-            # features, so each coefficient stays attributable to one modality
-            x1 = self.role_mixer(x1, x)
+            # corrections read the raw modality channels; a module that accepts
+            # context is also handed the frozen trunk features, so its
+            # correction can depend on what the backbone saw
+            x1 = self.role_mixer(x1, x, context=feat)
 
         # maintain the second output of feature size 256 for backwards compatibility
 

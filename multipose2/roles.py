@@ -146,6 +146,321 @@ class _RoleBranch(nn.Module):
         return self.net(x)
 
 
+FOREGROUND_CONSTRAINTS = ("none", "suppress_only", "sign_identifiable")
+FLOW_PARAMETERIZATIONS = ("direct", "potential")
+
+
+class MultiscaleBranch(nn.Module):
+    """A depthwise-separable dilated stack at full resolution.
+
+    Two stacked 3x3 convolutions see 5 pixels. A sensory neuron soma spans tens
+    of pixels, so a branch asked to judge transcript density over a whole cell
+    through a 5-pixel window cannot do it however well it is trained --
+    receptive field, not depth or width, is the binding constraint here.
+
+    Dilating a depthwise stack widens the receptive field geometrically for
+    roughly the parameter count of a plain two-layer branch, and every layer
+    stays at full resolution so the correction remains per-pixel.
+    """
+
+    def __init__(self, in_channels, nout, width=16, dilations=(1, 2, 4, 8, 16)):
+        super().__init__()
+        if not dilations:
+            raise ValueError("MultiscaleBranch needs at least one dilation")
+        self.dilations = tuple(int(d) for d in dilations)
+        self.stem = nn.Conv2d(in_channels, width, 1)
+        self.blocks = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(width, width, 3, padding=d, dilation=d, groups=width),
+                nn.GroupNorm(_groups(width), width),
+                nn.GELU(),
+                nn.Conv2d(width, width, 1),
+            ) for d in self.dilations)
+        self.head = nn.Conv2d(width, nout, 1)
+
+    @property
+    def receptive_field(self):
+        """Side length in pixels that one output value can see."""
+        return 1 + 2 * sum(self.dilations)
+
+    def forward(self, x, modulation=None):
+        h = self.stem(x)
+        if modulation is not None:
+            # FiLM: the frozen backbone's features scale and shift this
+            # modality's features, so its correction depends on what the
+            # backbone saw rather than on its own channels alone
+            scale, shift = modulation
+            h = h * (1. + scale) + shift
+        for block in self.blocks:
+            h = h + block(h)
+        return self.head(h)
+
+
+class ModalityCorrections(nn.Module):
+    """Per-modality corrections to foreground and flows, optionally conditioned.
+
+    Three configurations, which are the three arms worth comparing:
+
+    ``context_dim=None, cross_modality=False``
+        Independent corrections. A modality's correction is the same for the
+        same input whatever the other modalities say.
+    ``context_dim=D, cross_modality=False``
+        Each modality's features are modulated by the frozen backbone's, so a
+        transcript correction can depend on the morphology around it. Still
+        attributable per modality.
+    ``context_dim=D, cross_modality=True``
+        Modality features mix before the route heads, so conjunctions between
+        modalities are expressible. Attribution is given up in exchange.
+
+    The constraints that used to define four named operators are arguments here
+    instead, because separate foreground and flow routes are the defensible part
+    of the hypothesis and the rest are extra assumptions worth testing:
+
+    ``foreground_constraint``
+        ``"none"`` signed coefficient over a tanh branch, so one modality may
+        raise the logit in one place and lower it in another. ``"suppress_only"``
+        a non-negative coefficient over a log-sigmoid, which can only subtract.
+        ``"sign_identifiable"`` a signed coefficient over a sigmoid, so the sign
+        means something but the pattern cannot change sign.
+    ``flow_parameterization``
+        ``"direct"`` adds a two-channel correction to the flow field.
+        ``"potential"`` predicts a scalar and adds its gradient, which is how
+        Cellpose builds flows in the first place.
+
+    Defaults are the least assumptive of each. Flow corrections are not purely
+    cosmetic: mask reconstruction follows the flows, so they can merge, split or
+    remove instances as well as move a boundary.
+    """
+
+    def __init__(self, modalities, width=16, nout=3, context_dim=None,
+                 cross_modality=False, dilations=(1, 2, 4, 8, 16),
+                 foreground_constraint="none", flow_parameterization="direct",
+                 context_width=32, modality_dropout=0.):
+        super().__init__()
+        if foreground_constraint not in FOREGROUND_CONSTRAINTS:
+            raise ValueError(
+                f"foreground_constraint must be one of {FOREGROUND_CONSTRAINTS}, "
+                f"got {foreground_constraint!r}")
+        if flow_parameterization not in FLOW_PARAMETERIZATIONS:
+            raise ValueError(
+                f"flow_parameterization must be one of {FLOW_PARAMETERIZATIONS}, "
+                f"got {flow_parameterization!r}")
+        if not 0. <= modality_dropout < 1.:
+            raise ValueError("modality_dropout must be in [0, 1)")
+        if cross_modality and context_dim is None:
+            roles_logger.info(
+                ">>> cross_modality without context_dim: modalities will mix, "
+                "but neither they nor the mix can see the backbone's features")
+
+        self.modality_names = [str(name) for name, _ in modalities]
+        self.modality_channels = [tuple(int(c) for c in ch) for _, ch in modalities]
+        self.width = int(width)
+        self.nout = int(nout)
+        self.context_dim = context_dim
+        self.cross_modality = bool(cross_modality)
+        self.foreground_constraint = foreground_constraint
+        self.flow_parameterization = flow_parameterization
+        self.modality_dropout = float(modality_dropout)
+        self._presence_override = None
+        self.enabled = True
+
+        # one feature extractor per modality; the route heads come after, so a
+        # modality costs one branch rather than one per route
+        self.branches = nn.ModuleDict({
+            name: MultiscaleBranch(len(channels), width, width=width,
+                                   dilations=dilations)
+            for name, channels in zip(self.modality_names, self.modality_channels)})
+
+        if context_dim is not None:
+            self.context_proj = nn.Conv2d(int(context_dim), context_width, 1)
+            self.context_film = nn.ModuleDict({
+                name: nn.Conv2d(context_width, 2 * width, 1)
+                for name in self.modality_names})
+            for film in self.context_film.values():
+                nn.init.zeros_(film.weight)
+                nn.init.zeros_(film.bias)
+
+        flow_out = 1 if flow_parameterization == "potential" else 2
+        if self.cross_modality:
+            # a single 1x1 convolution would be linear in the concatenated
+            # features, so the only cross-modality nonlinearity would be the
+            # head's. Mix nonlinearly, or the arm cannot represent the
+            # conjunctions it exists to test.
+            self.mix = nn.Sequential(
+                nn.Conv2d(width * len(self.modality_names), width, 1),
+                nn.GroupNorm(_groups(width), width),
+                nn.GELU(),
+                nn.Conv2d(width, width, 3, padding=1),
+            )
+            coefs = ["mixed"]
+        else:
+            self.mix = None
+            coefs = list(self.modality_names)
+        self.foreground_head = nn.ModuleDict({
+            key: nn.Conv2d(width, 1, 1) for key in coefs})
+        self.flow_head = nn.ModuleDict({
+            key: nn.Conv2d(width, flow_out, 1) for key in coefs})
+        self.coefficients = nn.ParameterDict()
+        for key in coefs:
+            for route in ("foreground", "flow"):
+                init = (_OFF if (route == "foreground"
+                                 and foreground_constraint == "suppress_only")
+                        else 0.)
+                self.coefficients[f"{key}__{route}"] = nn.Parameter(
+                    torch.tensor(init, dtype=torch.float32))
+
+        self.register_buffer("sobel", _sobel_kernels(), persistent=False)
+
+    @property
+    def receptive_field(self):
+        return next(iter(self.branches.values())).receptive_field
+
+    @property
+    def _keys(self):
+        return ["mixed"] if self.cross_modality else self.modality_names
+
+    def coefficient(self, key, route):
+        raw = self.coefficients[f"{key}__{route}"]
+        if route == "foreground" and self.foreground_constraint == "suppress_only":
+            return F.softplus(raw)
+        return raw
+
+    def coefficient_table(self):
+        """Learned coefficients. A diagnostic, never evidence.
+
+        Not unique and not comparable across modalities: the coefficient bounds
+        a term per pixel but not how much of the image it acts on, correlated
+        modalities substitute for one another, and under cross_modality there is
+        one entry for the mix rather than one per modality.
+        """
+        return {key: {route: float(self.coefficient(key, route).detach())
+                      for route in ("foreground", "flow")}
+                for key in self._keys}
+
+    def l1(self):
+        total = None
+        for key in self._keys:
+            for route in ("foreground", "flow"):
+                term = self.coefficient(key, route).abs()
+                total = term if total is None else total + term
+        return total
+
+    def _modality_features(self, inputs, context, dtype):
+        """Per-modality feature maps, FiLM-modulated by context when given."""
+        modulation = {}
+        if self.context_dim is not None and context is not None:
+            ctx = F.gelu(self.context_proj(context.to(dtype)))
+            ctx = F.interpolate(ctx, size=inputs.shape[-2:], mode="bilinear",
+                                align_corners=False)
+            for name in self.modality_names:
+                scale, shift = self.context_film[name](ctx).chunk(2, dim=1)
+                modulation[name] = (scale, shift)
+
+        presence = self._presence(inputs.shape[0], inputs.device, dtype)
+        feats, avail = {}, {}
+        for i, (name, channels) in enumerate(zip(self.modality_names,
+                                                 self.modality_channels)):
+            x_m = inputs[:, list(channels)].to(dtype)
+            h = self.branches[name](x_m, modulation.get(name))
+            mask = presence[:, i].reshape(-1, 1, 1, 1)
+            # masking the features makes an absent modality absent from the mix
+            feats[name] = h * mask
+            avail[name] = mask
+        return feats, avail
+
+    def _route_terms(self, inputs, context, dtype):
+        """Yield ``(key, route, term)`` for each correction term."""
+        feats, avail = self._modality_features(inputs, context, dtype)
+        if self.cross_modality:
+            mixed = self.mix(torch.cat([feats[n] for n in self.modality_names], 1))
+            sources, masks = {"mixed": mixed}, {"mixed": None}
+        else:
+            sources, masks = feats, avail
+        for key, h in sources.items():
+            # masking the features is not enough on its own: a route head has a
+            # bias, so head(0) is non-zero and an absent modality would still
+            # contribute. Mask the term too, which also keeps the independent
+            # arm exactly additive across modalities.
+            mask = masks[key]
+            fg = self.foreground_head[key](h)
+            if self.foreground_constraint == "suppress_only":
+                fg = F.logsigmoid(SUPPRESS_GAIN * torch.tanh(fg))
+            elif self.foreground_constraint == "sign_identifiable":
+                fg = torch.sigmoid(fg)
+            else:
+                fg = torch.tanh(fg)
+            fg_term = self.coefficient(key, "foreground").to(dtype) * fg
+            yield key, "foreground", fg_term if mask is None else fg_term * mask
+
+            fl = self.flow_head[key](h)
+            if self.flow_parameterization == "potential":
+                fl = torch.sigmoid(fl)
+            else:
+                fl = torch.tanh(fl)
+            fl_term = self.coefficient(key, "flow").to(dtype) * fl
+            yield key, "flow", fl_term if mask is None else fl_term * mask
+
+    def forward(self, base, inputs, context=None):
+        if not self.enabled:
+            return base
+        if base.shape[-2:] != inputs.shape[-2:]:
+            raise ValueError(
+                f"corrections are added at full resolution, but base is "
+                f"{tuple(base.shape[-2:])} and inputs are "
+                f"{tuple(inputs.shape[-2:])}")
+        if self.context_dim is not None and context is None:
+            raise ValueError(
+                "this module was built with context_dim, so it needs the frozen "
+                "trunk's features; Transformer.forward passes them automatically")
+
+        foreground = torch.zeros_like(base[:, -1:])
+        flows = torch.zeros_like(base[:, -3:-1])
+        potential = None
+        for _, route, term in self._route_terms(inputs, context, base.dtype):
+            if route == "foreground":
+                foreground = foreground + term
+            elif self.flow_parameterization == "potential":
+                potential = term if potential is None else potential + term
+            else:
+                flows = flows + term
+        if potential is not None:
+            flows = flows + F.conv2d(potential, self.sobel.to(potential.dtype),
+                                     padding=1)
+
+        out = base.clone()
+        out[:, -1:] = out[:, -1:] + foreground
+        out[:, -3:-1] = out[:, -3:-1] + flows
+        return out
+
+    @torch.no_grad()
+    def contribution_report(self, inputs, context=None):
+        """Measured effect of each term on the output it corrects."""
+        report = {key: {} for key in self._keys}
+        for key, route, term in self._route_terms(inputs, context, inputs.dtype):
+            effect = term
+            if route == "flow" and self.flow_parameterization == "potential":
+                effect = F.conv2d(term, self.sobel.to(term.dtype), padding=1)
+            mag = effect.abs()
+            peak = float(mag.max())
+            report[key][route] = {
+                "mean_abs": float(mag.mean()),
+                "max_abs": peak,
+                "frac_active": float(
+                    (mag > (peak / 100. if peak > 0 else float("inf"))
+                     ).to(torch.float32).mean()),
+            }
+        return report
+
+    def extra_repr(self):
+        return (f"modalities={self.modality_names}, width={self.width}, "
+                f"receptive_field={self.receptive_field}, "
+                f"context_dim={self.context_dim}, "
+                f"cross_modality={self.cross_modality}, "
+                f"foreground_constraint={self.foreground_constraint!r}, "
+                f"flow_parameterization={self.flow_parameterization!r}, "
+                f"enabled={self.enabled}")
+
+
 class RoleMixer(nn.Module):
     """Adds learned per-modality corrections to a base Cellpose prediction.
 
@@ -297,13 +612,16 @@ class RoleMixer(nn.Module):
     def _flows_from_potential(self, potential):
         return F.conv2d(potential, self.sobel.to(potential.dtype), padding=1)
 
-    def forward(self, base, inputs):
+    def forward(self, base, inputs, context=None):
         """Add role corrections to a base prediction.
 
         Args:
             base (torch.Tensor): Base prediction, ``[N x nout x Ly x Lx]``.
             inputs (torch.Tensor): Fused input stack, ``[N x C x Ly x Lx]``, at
                 the same spatial size as ``base``.
+            context: Accepted and ignored, so every correction module takes the
+                same call. This one reads raw channels only; ModalityCorrections
+                is the variant that uses the trunk's features.
 
         Returns:
             torch.Tensor: ``base`` with the role corrections added.
@@ -462,7 +780,8 @@ class UnrestrictedCorrection(nn.Module):
             "mixer (%+d)", best, realized, target, realized - target)
         return model
 
-    def forward(self, base, inputs):
+    def forward(self, base, inputs, context=None):
+        """``context`` is accepted and ignored, so every arm takes the same call."""
         if not self.enabled:
             return base
         if base.shape[-2:] != inputs.shape[-2:]:
@@ -474,3 +793,10 @@ class UnrestrictedCorrection(nn.Module):
 
     def extra_repr(self):
         return f"nout={self.nout}, enabled={self.enabled}"
+
+
+# Availability handling is identical for both correction modules: an unavailable
+# modality contributes nothing, while an observed modality reading zero is still
+# evidence a branch may learn from.
+ModalityCorrections.set_presence = RoleMixer.set_presence
+ModalityCorrections._presence = RoleMixer._presence

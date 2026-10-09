@@ -278,6 +278,28 @@ def _sparsity_penalty(net, role_l1=0., adapter_l1=0.):
     return total
 
 
+def _sync_stochastic_depth(net):
+    """Turn stochastic depth off while the encoder is frozen, on when it is not.
+
+    Layer dropping regularizes the layers it drops. With the encoder frozen it
+    regularizes nothing and only adds variance that the trainable parameters
+    have to average out, and it leaves the frozen base non-deterministic, which
+    rules out caching it.
+    """
+    if not hasattr(net, "set_deterministic_trunk"):
+        return
+    encoder_trainable = any(p.requires_grad for name, p in net.named_parameters()
+                            if name.startswith("encoder."))
+    if getattr(net, "deterministic_trunk", False) == (not encoder_trainable):
+        return
+    net.set_deterministic_trunk(not encoder_trainable)
+    train_logger.info(
+        ">>> stochastic depth %s (encoder %s)",
+        "off, trunk deterministic" if not encoder_trainable else "on",
+        "frozen" if not encoder_trainable else "trainable",
+    )
+
+
 def _is_never_trainable(name):
     """Parameters the architecture declares with requires_grad=False.
 
@@ -305,6 +327,7 @@ def set_trainable_parameters(net, trainable_mode="all", n_trainable_blocks=2):
         param.requires_grad = (trainable_mode == "all" and
                                not _is_never_trainable(name))
     if trainable_mode == "all":
+        _sync_stochastic_depth(net)
         trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
         total = sum(p.numel() for p in net.parameters())
         train_logger.info(
@@ -329,6 +352,8 @@ def set_trainable_parameters(net, trainable_mode="all", n_trainable_blocks=2):
     for name, param in net.named_parameters():
         param.requires_grad = (any(name.startswith(prefix) for prefix in prefixes)
                                and not _is_never_trainable(name))
+
+    _sync_stochastic_depth(net)
 
     trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
     total = sum(p.numel() for p in net.parameters())
