@@ -172,7 +172,9 @@ def test_synthesize_multimodal_training_dir_ignores_secondary_masks(tmp_path):
               np.zeros((16, 16, 3), dtype=np.uint8))
     io.imsave(str(he_dir / "DRG_1_HES_0_500_masks.png"),
               np.zeros((16, 16), dtype=np.uint8))
-    io.imsave(str(tx_dir / "DRG_1_SegTrans_0_500.jpg"),
+    # .tif, not .jpg: a single-channel JPEG round-trips to three channels, which
+    # would make this a 6-channel fusion and stop it testing mixed widths
+    io.imsave(str(tx_dir / "DRG_1_SegTrans_0_500.tif"),
               np.ones((16, 16, 1), dtype=np.uint8))
     io.imsave(str(tx_dir / "DRG_1_SegTrans_0_500_masks.png"),
               np.zeros((16, 16), dtype=np.uint8))
@@ -203,7 +205,9 @@ def test_synthesize_multimodal_training_dir_accepts_mask_filter_with_extension(t
 
     io.imsave(str(he_dir / "DRG_1_HES_0_500.jpg"),
               np.zeros((16, 16, 3), dtype=np.uint8))
-    io.imsave(str(tx_dir / "DRG_1_SegTrans_0_500.jpg"),
+    # .tif, not .jpg: a single-channel JPEG round-trips to three channels, which
+    # would make this a 6-channel fusion and stop it testing mixed widths
+    io.imsave(str(tx_dir / "DRG_1_SegTrans_0_500.tif"),
               np.ones((16, 16, 1), dtype=np.uint8))
     io.imsave(str(he_dir / "DRG_1_HES_0_500_masks.png"),
               np.zeros((16, 16), dtype=np.uint8))
@@ -751,3 +755,25 @@ def test_bf16_is_rejected_on_pre_ampere_gpus(monkeypatch):
 def test_cuda_supports_bf16_is_false_off_cuda():
     assert train._cuda_supports_bf16(torch.device("cpu")) is False
     assert train._cuda_supports_bf16(None) is False
+
+
+def test_single_channel_jpeg_modality_inflates_to_three_channels(tmp_path):
+    """Documents a trap in the data pipeline, not desired behaviour.
+
+    cv2 writes a single-channel array to JPEG as a 3-channel image and reads it
+    back as BGR, so a grayscale modality stored as .jpg contributes three
+    identical channels to the fused stack instead of one. The adapter then
+    spends capacity on duplicates, and nchan overstates how much information is
+    actually present. Store single-channel modalities losslessly.
+    """
+    gray = np.ones((16, 16, 1), dtype=np.uint8) * 7
+    io.imsave(str(tmp_path / "g.jpg"), gray)
+    io.imsave(str(tmp_path / "g.tif"), gray)
+
+    as_jpeg = io.imread(str(tmp_path / "g.jpg"))
+    as_tiff = io.imread(str(tmp_path / "g.tif"))
+
+    assert as_jpeg.shape == (16, 16, 3)
+    assert np.array_equal(as_jpeg[..., 0], as_jpeg[..., 1])
+    assert np.array_equal(as_jpeg[..., 1], as_jpeg[..., 2])
+    assert as_tiff.shape == (16, 16, 1)
