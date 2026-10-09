@@ -16,6 +16,7 @@ import logging
 models_logger = logging.getLogger(__name__)
 
 from . import transforms, dynamics, utils, plot
+from .modality_norm import ModalityNormalizer
 from .vit_sam import Transformer
 from .core import assign_device, run_net, run_3D
 
@@ -296,14 +297,25 @@ class CellposeModel():
 
 
         # normalize image
+        modality_normalizer = None
         normalize_params = normalize_default
-        if isinstance(normalize, dict):
+        if isinstance(normalize, ModalityNormalizer):
+            # the same fitted transform training used; applying anything else
+            # here silently shifts the input distribution between fit and
+            # inference, which no metric would reveal
+            modality_normalizer = normalize
+            normalize_params = {**normalize_params, "normalize": False}
+        elif isinstance(normalize, dict):
             normalize_params = {**normalize_params, **normalize}
         elif not isinstance(normalize, bool):
-            raise ValueError("normalize parameter must be a bool or a dict")
+            raise ValueError(
+                "normalize parameter must be a bool, a dict, or a ModalityNormalizer")
         else:
             normalize_params["normalize"] = normalize
             normalize_params["invert"] = invert
+
+        if modality_normalizer is not None:
+            x = np.stack([modality_normalizer(xi, channel_axis=-1) for xi in x])
 
         # pre-normalize if 3D stack for stitching or do_3D
         do_normalization = True if normalize_params["normalize"] else False

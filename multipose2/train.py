@@ -4,6 +4,7 @@ import json
 from contextlib import contextmanager
 import numpy as np
 from . import io, utils, models, dynamics
+from .modality_norm import ModalityNormalizer
 from .transforms import normalize_img, random_rotate_and_resize
 from pathlib import Path
 import torch
@@ -163,10 +164,14 @@ def _reshape_norm(data, channel_axis=None, normalize_params={"normalize": False}
         data_new.append(td)
     data = data_new
     if normalize_params["normalize"]:
-        data = [
-            normalize_img(td, normalize=normalize_params, axis=0)
-            for td in data
-        ]
+        modality_normalizer = normalize_params.get("modality_normalizer")
+        if modality_normalizer is not None:
+            data = [modality_normalizer(td, channel_axis=0) for td in data]
+        else:
+            data = [
+                normalize_img(td, normalize=normalize_params, axis=0)
+                for td in data
+            ]
     return data
 
 def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
@@ -801,7 +806,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         n_epochs (int, optional): Integer - number of times to go through the whole training set during training. Defaults to 100.
         weight_decay (float, optional): Float - weight decay for the optimizer. Defaults to 0.1.
         SGD (bool, optional): Deprecated in v4.0.1+ - AdamW always used.
-        normalize (bool or dict, optional): Boolean or dictionary - whether to normalize the data. Defaults to True.
+        normalize (bool, dict, or ModalityNormalizer, optional): Whether and how to normalize. A ModalityNormalizer applies a per-modality transform whose global parameters were fitted on the training set, which matters when modalities differ in kind: per-crop percentiles suit morphology but destroy the absolute density that carries the signal in transcript counts. Defaults to True.
         compute_flows (bool, optional): Boolean - whether to compute flows during training. Defaults to False.
         save_path (str, optional): String - where to save the trained model. Defaults to None.
         save_every (int, optional): Integer - save the network every [save_every] epochs. Defaults to 100.
@@ -829,6 +834,25 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     if SGD:
         train_logger.warning("SGD is deprecated, using AdamW instead")
 
+    if isinstance(normalize, ModalityNormalizer):
+        # a per-modality transform whose globals are already fitted on the
+        # training set; carried through so _reshape_norm uses it in place of the
+        # one-rule-for-every-channel default
+        if not normalize.is_fitted:
+            raise ValueError(
+                "the ModalityNormalizer passed as normalize= has unfitted modes; "
+                "call its fit() on the training images first")
+        normalize_params = {"normalize": True, "modality_normalizer": normalize}
+        train_logger.info(">>> normalizing per modality: %r", normalize)
+    elif isinstance(normalize, dict):
+        normalize_params = {**models.normalize_default, **normalize}
+    elif not isinstance(normalize, bool):
+        raise ValueError(
+            "normalize parameter must be a bool, a dict, or a ModalityNormalizer")
+    else:
+        normalize_params = models.normalize_default
+        normalize_params["normalize"] = normalize
+
     device = net.device
 
     original_net_dtype = net.dtype 
@@ -849,14 +873,6 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     )
 
     scale_range = 0.5 if scale_range is None else scale_range
-
-    if isinstance(normalize, dict):
-        normalize_params = {**models.normalize_default, **normalize}
-    elif not isinstance(normalize, bool):
-        raise ValueError("normalize parameter must be a bool or a dict")
-    else:
-        normalize_params = models.normalize_default
-        normalize_params["normalize"] = normalize
 
     out = _process_train_test(train_data=train_data, train_labels=train_labels,
                               train_files=train_files, train_labels_files=train_labels_files,
