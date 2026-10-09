@@ -33,6 +33,20 @@ _AMP_DTYPE_NAMES = {
 }
 
 
+def _cuda_supports_bf16(device):
+    """True only where bfloat16 is hardware-accelerated.
+
+    torch.cuda.is_bf16_supported() defaults to including_emulation=True, so it
+    returns True on pre-Ampere cards where bfloat16 is emulated in software and
+    is far slower than float16 -- slower than float32 in practice. Compute
+    capability 8.0 is the first with native bfloat16 tensor cores, so check that
+    directly rather than trusting the convenience helper.
+    """
+    if device is None or device.type != "cuda":
+        return False
+    return torch.cuda.get_device_properties(device).major >= 8
+
+
 def _resolve_amp_dtype(amp_dtype, device):
     """Choose the autocast dtype and whether gradient scaling is required.
 
@@ -56,7 +70,7 @@ def _resolve_amp_dtype(amp_dtype, device):
 
     if amp_dtype in ("auto", True):
         if device.type == "cuda":
-            dtype = (torch.bfloat16 if torch.cuda.is_bf16_supported()
+            dtype = (torch.bfloat16 if _cuda_supports_bf16(device)
                      else torch.float16)
         elif device.type == "cpu":
             dtype = torch.bfloat16
@@ -77,10 +91,11 @@ def _resolve_amp_dtype(amp_dtype, device):
         )
 
     if (dtype == torch.bfloat16 and device.type == "cuda"
-            and not torch.cuda.is_bf16_supported()):
+            and not _cuda_supports_bf16(device)):
         train_logger.warning(
-            "bfloat16 autocast requested but this GPU does not support it "
-            "(needs compute capability 8.0+); using float16 with gradient scaling"
+            "bfloat16 autocast requested but this GPU has no bfloat16 hardware "
+            "(needs compute capability 8.0+, where bfloat16 would otherwise be "
+            "emulated in software); using float16 with gradient scaling instead"
         )
         dtype = torch.float16
     return dtype, dtype == torch.float16

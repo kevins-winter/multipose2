@@ -716,3 +716,38 @@ def test_autocast_actually_changes_the_forward_dtype(tmp_path):
             model_name=f"spy_{amp}", rescale=False, amp_dtype=amp,
         )
         assert net.seen == {expected}, f"amp_dtype={amp!r} gave {net.seen}"
+
+
+class _FakeCudaDevice:
+    type = "cuda"
+
+
+class _FakeProps:
+    def __init__(self, major):
+        self.major = major
+
+
+def test_bf16_is_rejected_on_pre_ampere_gpus(monkeypatch):
+    """A T4 reports bf16 support through emulation; it must not be chosen.
+
+    torch.cuda.is_bf16_supported() returns True on compute 7.5 because bfloat16
+    is emulated in software there, which is far slower than float16. Selecting
+    it made a real training epoch roughly 30x slower than it should have been.
+    """
+    dev = _FakeCudaDevice()
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda d: _FakeProps(7))
+    assert train._cuda_supports_bf16(dev) is False
+    assert train._resolve_amp_dtype("auto", dev) == (torch.float16, True)
+    # an explicit request must fall back rather than use the emulated path
+    assert train._resolve_amp_dtype("bfloat16", dev) == (torch.float16, True)
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda d: _FakeProps(8))
+    assert train._cuda_supports_bf16(dev) is True
+    assert train._resolve_amp_dtype("auto", dev) == (torch.bfloat16, False)
+    assert train._resolve_amp_dtype("bfloat16", dev) == (torch.bfloat16, False)
+
+
+def test_cuda_supports_bf16_is_false_off_cuda():
+    assert train._cuda_supports_bf16(torch.device("cpu")) is False
+    assert train._cuda_supports_bf16(None) is False
