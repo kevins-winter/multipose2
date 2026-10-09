@@ -420,7 +420,7 @@ def test_control_starts_as_an_exact_no_op_but_still_learns():
         assert torch.equal(ctrl(base, x), base), "both arms must start identical"
     # a zero-initialised head keeps its own gradient, so the layer learns first
     ctrl(base, x).square().mean().backward()
-    assert float(ctrl.head.weight.grad.abs().sum()) > 0
+    assert float(ctrl.net.head.weight.grad.abs().sum()) > 0
 
 
 def test_control_writes_every_output_channel_without_structure():
@@ -428,8 +428,8 @@ def test_control_writes_every_output_channel_without_structure():
     ctrl = UnrestrictedCorrection(in_channels=5, width=12)
     base, x = _base(), _inputs()
     with torch.no_grad():
-        ctrl.head.weight.normal_(0., 0.2)
-        ctrl.head.bias.normal_(0., 0.2)
+        ctrl.net.head.weight.normal_(0., 0.2)
+        ctrl.net.head.bias.normal_(0., 0.2)
         delta = ctrl(base, x) - base
     # unlike the mixer, nothing confines it to one output or one sign
     assert delta[:, -1:].abs().max() > 0
@@ -453,7 +453,7 @@ def test_groups_divides_every_width():
     from multipose2.roles import _groups, UnrestrictedCorrection
     for w in range(1, 128):
         assert w % _groups(w) == 0
-        UnrestrictedCorrection(in_channels=4, width=w, depth=1)
+        UnrestrictedCorrection(in_channels=4, width=w, dilations=(1,))
 
 
 def test_sparsity_penalty_skips_a_control_with_no_coefficients():
@@ -707,3 +707,21 @@ def test_stochastic_depth_follows_encoder_trainability():
         a = net.forward_trunk(net.input_adapter(x))
         b = net.forward_trunk(net.input_adapter(x))
     assert not torch.allclose(a, b, atol=1e-6), "layer dropping should resume"
+
+
+def test_control_matches_receptive_field_not_only_parameters():
+    """Otherwise a win for the structured arm could be a receptive-field win."""
+    from multipose2.roles import UnrestrictedCorrection
+    m = _corr(context_dim=256)
+    ctrl = UnrestrictedCorrection.matched_to(m, in_channels=5)
+    assert ctrl.receptive_field == m.receptive_field == 63
+    target = sum(p.numel() for p in m.parameters())
+    assert abs(sum(p.numel() for p in ctrl.parameters()) - target) / target < 0.05
+
+
+def test_control_param_formula_matches_a_built_model():
+    from multipose2.roles import UnrestrictedCorrection
+    for width in (1, 7, 16, 21, 64):
+        built = UnrestrictedCorrection(in_channels=6, nout=3, width=width)
+        assert sum(p.numel() for p in built.parameters()) == \
+            UnrestrictedCorrection._param_count(6, 3, width, 5)

@@ -723,61 +723,63 @@ class UnrestrictedCorrection(nn.Module):
         depth (int, optional): Number of hidden convolutions.
     """
 
-    def __init__(self, in_channels, nout=3, width=16, depth=2):
+    def __init__(self, in_channels, nout=3, width=16,
+                 dilations=(1, 2, 4, 8, 16)):
         super().__init__()
-        if depth < 1:
-            raise ValueError("depth must be >= 1")
-        layers, c_in = [], int(in_channels)
-        for _ in range(depth):
-            layers += [nn.Conv2d(c_in, width, 3, padding=1),
-                       nn.GroupNorm(_groups(width), width),
-                       nn.GELU()]
-            c_in = width
-        self.head = nn.Conv2d(width, nout, 3, padding=1)
-        self.net = nn.Sequential(*layers)
+        # the same stack the per-modality branches use, so the arms differ in
+        # structure alone. With a plain two-convolution body the control would
+        # see 5 pixels against their 63, and a win for the structured arm could
+        # be explained by receptive field rather than by structure.
+        self.net = MultiscaleBranch(int(in_channels), int(nout), width=width,
+                                    dilations=dilations)
         with torch.no_grad():
-            self.head.weight.zero_()
-            self.head.bias.zero_()
+            self.net.head.weight.zero_()
+            self.net.head.bias.zero_()
         self.nout = int(nout)
         self.enabled = True
 
+    @property
+    def receptive_field(self):
+        return self.net.receptive_field
+
     @staticmethod
-    def _param_count(in_channels, nout, width, depth):
-        total = 0
-        c_in = in_channels
-        for _ in range(depth):
-            total += c_in * width * 9 + width      # conv
-            total += 2 * width                     # group norm
-            c_in = width
-        total += width * nout * 9 + nout           # head
-        return total
+    def _param_count(in_channels, nout, width, n_dilations):
+        """Parameters of the MultiscaleBranch this wraps, without building it."""
+        return (in_channels * width + width
+                + n_dilations * (13 * width + width * width)
+                + width * nout + nout)
 
     @classmethod
-    def matched_to(cls, mixer, in_channels, nout=3, depth=2, max_width=512):
-        """Build one whose parameter count is as close as possible to ``mixer``.
+    def matched_to(cls, corrections, in_channels, nout=3,
+                   dilations=(1, 2, 4, 8, 16), max_width=512):
+        """Build one whose parameter count is as close as possible.
 
         Args:
-            mixer (nn.Module): The RoleMixer this arm is the control for.
+            corrections (nn.Module): The correction module this is the control
+                for; any of RoleMixer or ModalityCorrections.
             in_channels (int): Channels in the fused input stack.
             nout (int, optional): Output channel count.
-            depth (int, optional): Number of hidden convolutions.
+            dilations (tuple, optional): Matched to the structured arm's, so the
+                two have the same receptive field.
             max_width (int, optional): Largest width to consider.
 
         Returns:
             UnrestrictedCorrection: Sized to match, with its realized parameter
             count recorded on ``matched_target`` and ``matched_error``.
         """
-        target = sum(p.numel() for p in mixer.parameters())
+        target = sum(p.numel() for p in corrections.parameters())
+        n_d = len(dilations)
         best = min(range(1, max_width + 1),
-                   key=lambda w: abs(cls._param_count(in_channels, nout, w,
-                                                      depth) - target))
-        model = cls(in_channels, nout=nout, width=best, depth=depth)
+                   key=lambda w: abs(cls._param_count(in_channels, nout, w, n_d)
+                                     - target))
+        model = cls(in_channels, nout=nout, width=best, dilations=dilations)
         realized = sum(p.numel() for p in model.parameters())
         model.matched_target = int(target)
         model.matched_error = int(realized - target)
         roles_logger.info(
-            ">>> capacity-matched control: width=%d, %d parameters vs %d in the "
-            "mixer (%+d)", best, realized, target, realized - target)
+            ">>> capacity-matched control: width=%d, receptive field %d px, "
+            "%d parameters vs %d (%+d)", best, model.receptive_field, realized,
+            target, realized - target)
         return model
 
     def forward(self, base, inputs, context=None):
@@ -789,10 +791,11 @@ class UnrestrictedCorrection(nn.Module):
                 f"corrections are added at full resolution, but base is "
                 f"{tuple(base.shape[-2:])} and inputs are "
                 f"{tuple(inputs.shape[-2:])}")
-        return base + self.head(self.net(inputs.to(base.dtype))).to(base.dtype)
+        return base + self.net(inputs.to(base.dtype)).to(base.dtype)
 
     def extra_repr(self):
-        return f"nout={self.nout}, enabled={self.enabled}"
+        return (f"nout={self.nout}, receptive_field={self.receptive_field}, "
+                f"enabled={self.enabled}")
 
 
 # Availability handling is identical for both correction modules: an unavailable
