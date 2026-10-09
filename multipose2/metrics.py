@@ -136,8 +136,12 @@ def average_precision(masks_true, masks_pred, threshold=[0.5, 0.75, 0.9]):
         fp[n] = n_pred[n] - tp[n]
         fn[n] = n_true[n] - tp[n]
         denom = tp[n] + fp[n] + fn[n]
-        empty_true_empty_pred = (n_true[n] == 0 and n_pred[n] == 0)
-        ap[n] = np.where(denom > 0, tp[n] / denom, empty_true_empty_pred)
+        # an image with no true and no predicted masks is scored as perfect.
+        # np.where would evaluate both branches and warn on the 0/0 it discards,
+        # so divide only where the denominator is positive.
+        default = 1. if (n_true[n] == 0 and n_pred[n] == 0) else 0.
+        ap[n] = np.divide(tp[n], denom, where=denom > 0,
+                          out=np.full(denom.shape, default, dtype=ap.dtype))
 
     if not_list:
         ap, tp, fp, fn = ap[0], tp[0], fp[0], fn[0]
