@@ -508,3 +508,22 @@ Trial caveats to keep:
   correction epochs), **estimated** ~17–20 min per run, ~1 h for one seed of three
   arms. Pilot checkpoints are named `..._trial_pilot_...` so they never resume into
   full runs. A pilot is a plumbing check and first read, not a result.
+
+### Design rule added 2026-10-30: one modality is stock Cellpose-SAM
+
+The user's requirement: when only one modality is provided, the algorithm must
+behave exactly as Cellpose-SAM did. Implemented as:
+- `adapter_type="none"` (`PassthroughInputAdapter`): no parameters, 1–3 channels,
+  zero-pads to 3. Forward is **bit-identical** to the stock forward (test).
+- Single-modality `percentile` normalization equals `normalize_img(**normalize_default)`
+  exactly, flat channels included (test). No code change was needed there.
+- Notebook: `SINGLE_MODALITY = len(LAYOUT) == 1` (cell 12) switches training and
+  eval to no adapter, no corrections, `normalize=True`, and `STOCK_STAGES`
+  (train_seg defaults: `all`, 1e-5, 100 epochs, warmup 10).
+- Trial 6c: single-modality arms default to that stock recipe
+  (`TRIAL_SINGLE_MODALITY_RECIPE = "stock"`); `"matched"` restores the
+  identical-pipeline control. Stock vs combo changes inputs **and** pipeline;
+  matched isolates inputs. Quote stock as headline, matched as control.
+- Not identical to stock, deliberately: `batch_size` and `min_train_masks` are
+  shared notebook settings (data and memory, not algorithm); fp16 autocast
+  actually runs here, where upstream silently disabled it (§8).
