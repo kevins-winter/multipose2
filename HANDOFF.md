@@ -1,7 +1,7 @@
 # Multipose2 multimodal segmentation — session handoff
 
 Written for a fresh Claude session picking this work up. Branch `multimodal-adapters`,
-HEAD `9abd2f7`. Everything below is either labelled **measured**, **estimated**, or
+HEAD `5dcc4ac` (updated 2026-10-30; §18 lists what changed since `9abd2f7`). Everything below is either labelled **measured**, **estimated**, or
 **unknown**. Do not promote an estimate to a measurement, and do not treat the
 unknowns as settled — two of them determine what the project can claim.
 
@@ -50,10 +50,11 @@ conda run -n multipose2 python -m pytest \
 bare `pytest tests/` — `test_output.py` and `test_shape.py` run model eval, and
 `test_class_train`/`test_cli_train` actually train. Colab T4 is the only GPU.
 
-Notebook: `notebooks/train_multipose2_multimodal_adapters.ipynb`, 34 cells.
+Notebook: `notebooks/train_multipose2_multimodal_adapters.ipynb`, 36 cells.
 Sections: 0 preflight · 1 config · 2 synthesis · **2b per-modality normalization** ·
 3 visualize · 4 train · 4b run manifest · 5 curves · 6 eval · **6b baselines** ·
-channel diagnostics · single-modality baselines · 7 inspect · 8 W2 audit.
+channel diagnostics · single-modality baselines · **6c modality trial** · 7 inspect ·
+8 W2 audit.
 
 ---
 
@@ -234,6 +235,7 @@ appeared on ~5/15 and ~6/15 empty crops.
 | `pip install` was a no-op on re-run | removing `--upgrade` blocked new commits | **me** |
 | presence masked features, not terms | route-head bias leaked; broke additivity | **me**, caught by a test |
 | control had 5 px field vs arms' 63 px | would confound structure with receptive field | **me**, caught by reading the arm table |
+| `f1_50_95` dropped IoU 0.95 | `arange(0.5, 1.0, 0.05)[-1]` is `0.9500000000000004`, fails `<= 0.95`; averaged 9 thresholds | this branch; fixed `aecc0dc`, never affected a reported number |
 
 ---
 
@@ -315,7 +317,8 @@ by ~304 M opaque ones. At best the **adjustment** is explained, not the segmenta
 
 ## 12. Open work, prioritized
 
-1. **Run section 2b's channel report on the real data.** One cell. Gates everything.
+1. **Run section 2b's channel survey on the real data.** One cell. Gates everything.
+   It now covers every training crop (`ModalityNormalizer.survey`, `78777bc`).
 2. **Ask about the annotation protocol.** A conversation, not code.
 3. **Re-render single-channel modalities losslessly** (`.tif`), re-run synthesis with
    `overwrite=True`, so transcripts stop becoming three duplicates.
@@ -337,6 +340,8 @@ by ~304 M opaque ones. At best the **adjustment** is explained, not the segmenta
    structured arm does more compute at equal parameters.
 9. Consider **pairwise branches** if arm 3 beats arm 1 — attribution for a pair is
    still readable, unlike the full mix.
+10. **Run the modality trial (notebook 6c)** once step 6 has picked an arm: set
+    `TRIAL_CORRECTIONS`, `RUN_TRIAL = True`, one seed first. See §18.
 
 ---
 
@@ -387,7 +392,10 @@ real data.
   duplicate channels, i.e. the JPEG inflation. `channel_report` cannot see this —
   a duplicated channel has healthy variance and reads as alive.
 
-**Both inspect `train_data[0]` only.** That is the one real weakness: the dead-channel
+**Resolved in `78777bc`:** both cells now survey every crop and report the fraction
+in which each channel dies or duplicates another; cell 26 shows per-crop vs fitted
+side by side. The original concern, kept for context — **both inspected
+`train_data[0]` only.** That was the one real weakness: the dead-channel
 failure is crop-dependent by construction (sparse crops die, dense ones do not), so a
 single crop can report all-clear while a third of the training set is silently
 single-modality. Before trusting either, loop the report over every crop and summarize
@@ -467,3 +475,32 @@ e03d03b  Add per-epoch timing breakdown to segmentation training
   needs a local GPU, and never run a heavy test suite without being asked.
 - Say what is measured and what is estimated, every time. Several of the corrections
   in §9 happened because an estimate was stated as a fact.
+
+---
+
+## 18. Since `9abd2f7`
+
+- `78777bc` **Channel survey over every crop.** `ModalityNormalizer.survey(images)`
+  returns per-channel `frac_dead` and pairwise `frac_identical`. Cells 12 and 26 use
+  it. Closes §15's weakness. Still **unrun on real data**.
+- `aecc0dc` **`f1_50_95` now includes IoU 0.95.** See §8.
+- `5dcc4ac` **Notebook section 6c: modality trial.** One arm per modality in
+  `LAYOUT` (H&E alone, transcripts alone) plus `combo`, all through the identical
+  pipeline. Only the input channels differ. `TRIAL_CORRECTIONS` is the algorithm
+  under test (`None` = adapter + head only; or arm 1/2/3), and when set a
+  `roles_only` stage is appended for **every** arm, so single-modality arms get the
+  same corrections over their own modality. Reports pooled F1-50 and F1-50-95 per
+  seed, plus a paired bootstrap over test crops for combo minus each single arm.
+  `RUN_TRIAL = False` by default. **Unrun; logic checked only on CPU** (its F1
+  helper matches `pooled_f1`), not end to end.
+
+Trial caveats to keep:
+- ~10 test crops contain neurons, so the bootstrap interval is the result, not the
+  means. An interval spanning zero is "no detectable difference", not "no difference".
+- Seeds vary only torch-side randomness; `train_seg` reseeds numpy from the epoch
+  index, so augmentation order is the same across seeds. Spread is understated.
+- If transcripts are JPEG-duplicated, the ST-only arm is 3 identical channels: it
+  still measures transcript-only performance, but run step 3 (`.tif` re-render)
+  first if the survey shows duplicates, or the combo arm wastes adapter capacity.
+- Cost **estimated** ~50 min per run on a T4 for the 60-epoch schedule
+  (3 arms x 3 seeds ≈ 7–8 h). Resume is wired in.
