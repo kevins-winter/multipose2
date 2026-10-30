@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 vit_logger = logging.getLogger(__name__)
 
-ADAPTER_TYPES = {"linear": 0, "msca_lite": 1}
+ADAPTER_TYPES = {"linear": 0, "msca_lite": 1, "none": 2}
 ADAPTER_TYPE_IDS = {v: k for k, v in ADAPTER_TYPES.items()}
 
 
@@ -50,6 +50,34 @@ class LinearInputAdapter(nn.Module):
 
     def forward(self, x):
         return self.proj(x)
+
+
+class PassthroughInputAdapter(nn.Module):
+    """No adapter: the input reaches the trunk exactly as in Cellpose-SAM.
+
+    For a single modality of at most 3 channels, which SAM takes natively.
+    Fewer than 3 channels are zero-padded, as Cellpose-SAM pads them. There are
+    no parameters, so nothing trains here and nothing needs a backward pass.
+    """
+
+    def __init__(self, in_channels):
+        super().__init__()
+        if not 1 <= in_channels <= 3:
+            raise ValueError(
+                f"adapter_type='none' passes channels straight to the 3-channel "
+                f"trunk, so it needs 1 to 3 channels, got {in_channels}")
+        self.in_channels = int(in_channels)
+
+    def channel_norms(self):
+        return torch.ones(self.in_channels)
+
+    def channel_l1(self):
+        return torch.zeros(())
+
+    def forward(self, x):
+        if x.shape[1] == 3:
+            return x
+        return F.pad(x, (0, 0, 0, 0, 0, 3 - x.shape[1]))
 
 
 class MSCALiteInputAdapter(nn.Module):
@@ -94,6 +122,8 @@ def _make_input_adapter(in_channels, adapter_type):
         return LinearInputAdapter(in_channels)
     if adapter_type == "msca_lite":
         return MSCALiteInputAdapter(in_channels)
+    if adapter_type == "none":
+        return PassthroughInputAdapter(in_channels)
     raise ValueError(
         f"Unknown adapter_type {adapter_type!r}; expected one of {sorted(ADAPTER_TYPES)}"
     )

@@ -246,3 +246,16 @@ def test_subset_of_nothing_raises():
     norm.fit([np.concatenate([_he(np.random.default_rng(0)), _counts()], axis=0)])
     with pytest.raises(ValueError, match="no modality covers"):
         norm.subset([])
+
+
+def test_single_percentile_modality_matches_stock_normalization():
+    from multipose2 import transforms
+    from multipose2.models import normalize_default
+    rng = np.random.default_rng(0)
+    img = rng.random((64, 64, 3), dtype=np.float32) * 255
+    img[..., 2] = 7.  # flat: stock zeroes it, and so must this
+    norm = ModalityNormalizer.from_layout(
+        [{"name": "he", "n_channels": 3, "mode": "percentile"}])
+    want = transforms.normalize_img(img.copy(), **normalize_default)
+    got = norm(img, channel_axis=-1)
+    np.testing.assert_array_equal(got, want)

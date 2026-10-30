@@ -69,7 +69,7 @@ def get_arg_parser():
                             type=str,
                             help="model to use for running or starting training")
     model_args.add_argument("--adapter_type", required=False, default="linear",
-                            choices=("linear", "msca_lite"), type=str,
+                            choices=("linear", "msca_lite", "none"), type=str,
                             help="input adapter used to fuse image channels before the SAM backbone")
     model_args.add_argument(
         "--add_model", required=False, default=None, type=str,

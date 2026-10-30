@@ -102,7 +102,7 @@ class CellposeModel():
             diam_mean (float, optional): Mean "diameter", 30. is built-in value for "cyto" model; 17. is built-in value for "nuclei" model; if saved in custom model file (cellpose>=2.0) then it will be loaded automatically and overwrite this value.
             device (torch device, optional): Device used for model running / training (torch.device("cuda") or torch.device("cpu")), overrides gpu input, recommended if you want to use a specific GPU (e.g. torch.device("cuda:1")).
             use_bfloat16 (bool, optional): Use 16bit float precision instead of 32bit for model weights. Default to 16bit (True).
-            adapter_type (str, optional): Input adapter used to map image channels to the 3-channel SAM backbone input. Defaults to "linear".
+            adapter_type (str, optional): Input adapter used to map image channels to the 3-channel SAM backbone input. "none" passes 1-3 channels straight through, exactly as Cellpose-SAM does. Defaults to "linear".
         """
         if diam_mean is not None:
             models_logger.warning(

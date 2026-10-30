@@ -80,3 +80,46 @@ def test_trunk_head_split_composes_to_forward():
         feat = net.forward_trunk(net.input_adapter(x))
         assert feat.shape == (2, 256, 8, 8)
         assert torch.equal(net.forward_head(feat), net(x)[0])
+
+
+def _stock_forward(net, x):
+    """Cellpose-SAM's forward: no adapter, the input goes straight to SAM."""
+    x = net.encoder.patch_embed(x)
+    if net.encoder.pos_embed is not None:
+        x = x + net.encoder.pos_embed
+    for blk in net.encoder.blocks:
+        x = blk(x)
+    x = net.encoder.neck(x.permute(0, 3, 1, 2))
+    x1 = net.out(x)
+    return torch.nn.functional.conv_transpose2d(x1, net.W2, stride=net.ps, padding=0)
+
+
+def test_no_adapter_is_exactly_stock_cellpose_sam():
+    net = vit_sam.Transformer(in_channels=3, bsize=64, adapter_type="none")
+    net.eval()
+    assert not list(net.input_adapter.parameters())
+    x = torch.randn(1, 3, 64, 64)
+    with torch.no_grad():
+        assert torch.equal(net(x)[0], _stock_forward(net, x))
+
+
+def test_no_adapter_zero_pads_fewer_channels_like_stock():
+    adapter = vit_sam.PassthroughInputAdapter(1)
+    x = torch.randn(2, 1, 16, 16)
+    padded = torch.cat([x, torch.zeros(2, 2, 16, 16)], dim=1)
+    assert torch.equal(adapter(x), padded)
+
+
+def test_no_adapter_rejects_more_than_three_channels():
+    import pytest
+    with pytest.raises(ValueError, match="1 to 3 channels"):
+        vit_sam.PassthroughInputAdapter(6)
+
+
+def test_no_adapter_checkpoint_round_trips(tmp_path):
+    src = MockTransformer(1, in_channels=3, adapter_type="none")
+    path = tmp_path / "none.pt"
+    src.save_model(path)
+    dst = MockTransformer(1, in_channels=3, adapter_type="none")
+    dst.load_model(path, device=dst.device)
+    assert dst.adapter_type == "none"
