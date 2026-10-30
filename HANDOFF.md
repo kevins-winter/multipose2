@@ -509,21 +509,26 @@ Trial caveats to keep:
   arms. Pilot checkpoints are named `..._trial_pilot_...` so they never resume into
   full runs. A pilot is a plumbing check and first read, not a result.
 
-### Design rule added 2026-10-30: one modality is stock Cellpose-SAM
+### Design rule added 2026-10-30: one modality is stock Cellpose-SAM after normalization
 
-The user's requirement: when only one modality is provided, the algorithm must
-behave exactly as Cellpose-SAM did. Implemented as:
+The user's requirement: with one modality, everything **after** normalization
+must perform and cost exactly as Cellpose-SAM did. Normalization stays the
+revised per-modality transform (§6, section 2b) for every run. The user
+explicitly rejected falling back to Cellpose's per-crop normalization; do not
+reintroduce it. Implemented as:
 - `adapter_type="none"` (`PassthroughInputAdapter`): no parameters, 1–3 channels,
-  zero-pads to 3. Forward is **bit-identical** to the stock forward (test).
-- Single-modality `percentile` normalization equals `normalize_img(**normalize_default)`
-  exactly, flat channels included (test). No code change was needed there.
+  zero-pads to 3. Forward is **bit-identical** to the stock forward (test), and no
+  gradient has to cross the trunk to reach an input adapter.
+- For H&E (`percentile` mode) the revised normalization happens to equal
+  `normalize_img(**normalize_default)` exactly (test). For transcripts it does not
+  (`fixed` / `log1p_fixed`), by design.
 - Notebook: `SINGLE_MODALITY = len(LAYOUT) == 1` (cell 12) switches training and
-  eval to no adapter, no corrections, `normalize=True`, and `STOCK_STAGES`
-  (train_seg defaults: `all`, 1e-5, 100 epochs, warmup 10).
-- Trial 6c: single-modality arms default to that stock recipe
-  (`TRIAL_SINGLE_MODALITY_RECIPE = "stock"`); `"matched"` restores the
-  identical-pipeline control. Stock vs combo changes inputs **and** pipeline;
-  matched isolates inputs. Quote stock as headline, matched as control.
-- Not identical to stock, deliberately: `batch_size` and `min_train_masks` are
-  shared notebook settings (data and memory, not algorithm); fp16 autocast
-  actually runs here, where upstream silently disabled it (§8).
+  eval to no adapter, no corrections and `STOCK_STAGES` (train_seg defaults:
+  `all`, 1e-5, 100 epochs, warmup 10), keeping `normalize=modality_normalizer`.
+- Trial 6c: single-modality arms default to that recipe
+  (`TRIAL_SINGLE_MODALITY_RECIPE = "stock"`), normalized with
+  `modality_normalizer.subset(chans)`; `"matched"` restores the identical-pipeline
+  control. Stock vs combo changes inputs **and** pipeline; matched isolates inputs.
+- Shared notebook settings, not reset to stock: `batch_size` and
+  `min_train_masks` (data and memory, not algorithm). fp16 autocast actually runs
+  here, where upstream silently disabled it (§8).
