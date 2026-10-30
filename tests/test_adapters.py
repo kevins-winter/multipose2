@@ -145,3 +145,30 @@ def test_balanced_init_rejects_a_layout_that_misses_channels():
     import pytest
     with pytest.raises(ValueError, match="exactly once"):
         vit_sam.LinearInputAdapter(6).init_balanced([[0, 1, 2], [3, 4]])
+
+
+def _one_step(adapter, x, target):
+    opt = torch.optim.SGD(adapter.parameters(), lr=0.1)
+    opt.zero_grad()
+    ((adapter(x) - target) ** 2).mean().backward()
+    opt.step()
+    return adapter.proj.weight.detach()[:, :, 0, 0].clone()
+
+
+def test_balanced_init_keeps_each_channel_identifiable_after_training():
+    """Order independence is equivariance, not symmetry: channels keep their
+    own weights, those weights diverge with their data, and reordering the
+    input reorders the weights with it."""
+    torch.manual_seed(0)
+    he, tx = torch.randn(4, 3, 8, 8), torch.randn(4, 3, 8, 8) * 0.1
+    target = torch.randn(4, 3, 8, 8)
+    groups = [[0, 1, 2], [3, 4, 5]]
+    w_a = _one_step(vit_sam.LinearInputAdapter(6).init_balanced(groups),
+                    torch.cat([he, tx], 1), target)
+    w_b = _one_step(vit_sam.LinearInputAdapter(6).init_balanced(groups),
+                    torch.cat([tx, he], 1), target)
+    # each modality's columns moved differently from the shared start...
+    assert not torch.allclose(w_a[:, :3], w_a[:, 3:])
+    # ...and the same channel ends up with the same weights in either order
+    assert torch.allclose(w_a[:, :3], w_b[:, 3:], atol=1e-6)
+    assert torch.allclose(w_a[:, 3:], w_b[:, :3], atol=1e-6)

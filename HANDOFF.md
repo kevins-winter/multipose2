@@ -527,6 +527,16 @@ implemented:
   Cellpose-SAM. Used by the trial and by cell 16 for `linear`. Cost: combo starts
   as an even blend, further from SAM's training distribution; may understate
   combo on short runs.
+- **Order independence must not cost identifiability** (user requirement). It
+  doesn't: it is equivariance, not symmetry. Each channel keeps its own adapter
+  column, columns diverge with their data, and reordering the input reorders the
+  columns (`test_balanced_init_keeps_each_channel_identifiable_after_training`).
+  The trial re-scores the trained combo with each modality zeroed
+  (`combo_without_<modality>`, eval only) and bootstraps `combo` minus each, which
+  identifies each modality's function by behaviour. It also prints how far each
+  channel's weights moved, diagnostic only: at lr 1e-5 they barely move, under
+  either init. Duplicated (JPEG) channels get identical updates forever and are
+  unidentifiable by construction.
 - **Normalization modes are declared by the user, per modality**, in the config
   cell (`modality_normalization`). Required, no default, also in the library
   (`ModalitySpec.mode`, `from_layout`). Never derive a mode from position or guess
