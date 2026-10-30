@@ -1,7 +1,7 @@
 # Multipose2 multimodal segmentation — session handoff
 
 Written for a fresh Claude session picking this work up. Branch `multimodal-adapters`,
-HEAD `5dcc4ac` (updated 2026-10-30; §18 lists what changed since `9abd2f7`). Everything below is either labelled **measured**, **estimated**, or
+HEAD after `5dcc4ac` (updated 2026-10-30; §18 lists what changed since `9abd2f7`). Everything below is either labelled **measured**, **estimated**, or
 **unknown**. Do not promote an estimate to a measurement, and do not treat the
 unknowns as settled — two of them determine what the project can claim.
 
@@ -504,3 +504,7 @@ Trial caveats to keep:
   first if the survey shows duplicates, or the combo arm wastes adapter capacity.
 - Cost **estimated** ~50 min per run on a T4 for the 60-epoch schedule
   (3 arms x 3 seeds ≈ 7–8 h). Resume is wired in.
+- `TRIAL_PILOT = True` (default) runs the same stages at 15 + 3 + 2 epochs (+5
+  correction epochs), **estimated** ~17–20 min per run, ~1 h for one seed of three
+  arms. Pilot checkpoints are named `..._trial_pilot_...` so they never resume into
+  full runs. A pilot is a plumbing check and first read, not a result.
