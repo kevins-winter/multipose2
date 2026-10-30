@@ -252,6 +252,28 @@ def _last_encoder_block_prefixes(net, n_trainable_blocks):
     return [f"encoder.blocks.{i}." for i in range(start, n_blocks)]
 
 
+def _param_groups(net, adapter_lr_scale=1.):
+    """Trainable parameters, with the input adapter in its own group.
+
+    Each group carries ``lr_scale``, which multiplies the stage learning rate.
+    The adapter has a handful of weights next to the trunk's ~300 M, and Adam
+    moves every weight by roughly the learning rate per step whatever the
+    gradient, so at a rate suited to the trunk the adapter barely moves (about
+    0.002 over a 20-epoch run at 1e-5, measured). Scaling only the adapter lets
+    the fusion weights be learned without changing anything else.
+    """
+    adapter, rest = [], []
+    for name, param in net.named_parameters():
+        if param.requires_grad:
+            (adapter if name.startswith("input_adapter.") else rest).append(param)
+    groups = []
+    if rest:
+        groups.append({"params": rest, "lr_scale": 1.})
+    if adapter:
+        groups.append({"params": adapter, "lr_scale": float(adapter_lr_scale)})
+    return groups
+
+
 def _sparsity_penalty(net, role_l1=0., adapter_l1=0.):
     """L1 terms that keep the interpretable parameters readable.
 
@@ -839,7 +861,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               trainable_mode="all", n_trainable_blocks=2, warmup_epochs=10,
               training_stages=None, resume=False, resume_every=0,
               resume_path=None, timing=True, timing_path=None,
-              amp_dtype="auto", role_l1=0., adapter_l1=0.):
+              amp_dtype="auto", role_l1=0., adapter_l1=0.,
+              adapter_lr_scale=1.):
     """
     Train the network with images for segmentation.
 
@@ -883,6 +906,7 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         amp_dtype (str or torch.dtype, optional): Autocast dtype for the forward pass, independent of the float32 master weights. "auto" picks bfloat16 on a GPU that supports it, float16 with gradient scaling otherwise, and bfloat16 on CPU. Pass "bfloat16"/"float16" to force one, or None/"float32" to train in full float32. Defaults to "auto".
         role_l1 (float, optional): Weight on the sum of the role mixer's coefficient magnitudes. Without it a modality spreads itself thinly over every role and the coefficient table stops being readable; the prior that a marker does one or two things is both correct and what makes the result interpretable. Defaults to 0.
         adapter_l1 (float, optional): Weight on a group lasso over the input adapter's channels, which drives whole channels to zero so that the surviving ones state which modalities earned trunk bandwidth. Defaults to 0.
+        adapter_lr_scale (float, optional): Multiplies the learning rate for the input adapter only. At a rate suited to the trunk the adapter's few weights barely move, so its fusion weights stay wherever they were initialised. Defaults to 1.
 
     Returns:
         tuple: A tuple containing the path to the saved model weights, training losses, and test losses.
@@ -1031,13 +1055,15 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
             net, trainable_mode=stage["trainable_mode"],
             n_trainable_blocks=stage["n_trainable_blocks"],
         )
-        trainable_params = [p for p in net.parameters() if p.requires_grad]
-        if len(trainable_params) == 0:
+        param_groups = _param_groups(net, adapter_lr_scale)
+        if not param_groups:
             raise ValueError(
                 f"trainable_mode={stage['trainable_mode']!r} selected no parameters"
             )
-        optimizer = torch.optim.AdamW(trainable_params, lr=stage["learning_rate"],
+        optimizer = torch.optim.AdamW(param_groups, lr=stage["learning_rate"],
                                       weight_decay=weight_decay)
+        if adapter_lr_scale != 1.:
+            train_logger.info(">>> input adapter learning rate x%g", adapter_lr_scale)
         if resume_optimizer_state is not None and istage == resume_istage:
             try:
                 optimizer.load_state_dict(resume_optimizer_state)
@@ -1069,7 +1095,8 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                 # otherwise use all images
                 rperm = np.random.permutation(np.arange(0, nimg))
             for param_group in optimizer.param_groups:
-                param_group["lr"] = LR[stage_epoch] # set learning rate
+                # set learning rate, scaled per group
+                param_group["lr"] = LR[stage_epoch] * param_group.get("lr_scale", 1.)
             net.train()
             for k in range(0, nimg_per_epoch, batch_size):
                 kend = min(k + batch_size, nimg_per_epoch)

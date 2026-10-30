@@ -777,3 +777,45 @@ def test_single_channel_jpeg_modality_inflates_to_three_channels(tmp_path):
     assert np.array_equal(as_jpeg[..., 0], as_jpeg[..., 1])
     assert np.array_equal(as_jpeg[..., 1], as_jpeg[..., 2])
     assert as_tiff.shape == (16, 16, 1)
+
+
+def test_adapter_gets_its_own_scaled_learning_rate():
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_adapter = torch.nn.Conv2d(6, 3, 1)
+            self.out = torch.nn.Conv2d(3, 3, 1)
+
+    net = Tiny()
+    groups = train._param_groups(net, adapter_lr_scale=100.)
+    scales = {id(p): g["lr_scale"] for g in groups for p in g["params"]}
+    assert all(scales[id(p)] == 100. for p in net.input_adapter.parameters())
+    assert all(scales[id(p)] == 1. for p in net.out.parameters())
+
+    # Adam moves each weight by about lr * scale per step, so the adapter
+    # moves ~100x as far as the rest on one step of the same loss
+    opt = torch.optim.AdamW(groups, lr=1e-5, weight_decay=0.)
+    for g in opt.param_groups:
+        g["lr"] = 1e-5 * g["lr_scale"]
+    before_a = net.input_adapter.weight.detach().clone()
+    before_o = net.out.weight.detach().clone()
+    net.out(net.input_adapter(torch.randn(2, 6, 4, 4))).pow(2).mean().backward()
+    opt.step()
+    moved_a = (net.input_adapter.weight - before_a).abs().max().item()
+    moved_o = (net.out.weight - before_o).abs().max().item()
+    assert moved_a == pytest.approx(1e-3, rel=0.05)
+    assert moved_o == pytest.approx(1e-5, rel=0.05)
+
+
+def test_frozen_parameters_are_left_out_of_every_group():
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_adapter = torch.nn.Conv2d(6, 3, 1)
+            self.out = torch.nn.Conv2d(3, 3, 1)
+
+    net = Tiny()
+    for p in net.out.parameters():
+        p.requires_grad = False
+    groups = train._param_groups(net, adapter_lr_scale=10.)
+    assert len(groups) == 1 and groups[0]["lr_scale"] == 10.
