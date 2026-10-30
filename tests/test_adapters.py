@@ -123,3 +123,25 @@ def test_no_adapter_checkpoint_round_trips(tmp_path):
     dst = MockTransformer(1, in_channels=3, adapter_type="none")
     dst.load_model(path, device=dst.device)
     assert dst.adapter_type == "none"
+
+
+def test_balanced_init_does_not_depend_on_modality_order():
+    he_first = vit_sam.LinearInputAdapter(6).init_balanced([[0, 1, 2], [3, 4, 5]])
+    tx_first = vit_sam.LinearInputAdapter(6).init_balanced([[0, 1, 2], [3, 4, 5]])
+    x = torch.randn(2, 6, 16, 16)
+    swapped = x[:, [3, 4, 5, 0, 1, 2]]
+    assert torch.allclose(he_first(x), tx_first(swapped), atol=1e-6)
+    # each modality contributes equally
+    assert torch.allclose(he_first(x), (x[:, :3] + x[:, 3:]) / 2, atol=1e-6)
+
+
+def test_balanced_init_of_one_modality_is_the_identity():
+    adapter = vit_sam.LinearInputAdapter(3).init_balanced([[0, 1, 2]])
+    x = torch.randn(1, 3, 8, 8)
+    assert torch.equal(adapter(x), x)
+
+
+def test_balanced_init_rejects_a_layout_that_misses_channels():
+    import pytest
+    with pytest.raises(ValueError, match="exactly once"):
+        vit_sam.LinearInputAdapter(6).init_balanced([[0, 1, 2], [3, 4]])

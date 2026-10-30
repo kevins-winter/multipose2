@@ -29,6 +29,35 @@ class LinearInputAdapter(nn.Module):
             for c in range(ncopy):
                 self.proj.weight[c, c, 0, 0] = 1.0
 
+    def init_balanced(self, modalities):
+        """Start with every modality contributing equally to the trunk input.
+
+        The identity init passes fused channels 0-2 and drops the rest, so a
+        multimodal model starts as Cellpose-SAM on whichever modality was
+        listed first, and listing them in another order trains a different
+        model. Here channel j of each modality feeds trunk channel j % 3 with
+        weight 1 / n_modalities, which does not depend on the order. With one
+        3-channel modality it is exactly the identity, i.e. Cellpose-SAM.
+
+        Args:
+            modalities (sequence of sequence of int): Each modality's channel
+                indices in the fused input; together they must cover every
+                channel exactly once.
+        """
+        groups = [[int(c) for c in chans] for chans in modalities]
+        flat = sorted(c for chans in groups for c in chans)
+        if flat != list(range(self.proj.in_channels)):
+            raise ValueError(
+                f"modalities must cover channels 0..{self.proj.in_channels - 1} "
+                f"exactly once, got {groups}")
+        with torch.no_grad():
+            self.proj.weight.zero_()
+            self.proj.bias.zero_()
+            for chans in groups:
+                for j, c in enumerate(chans):
+                    self.proj.weight[j % 3, c, 0, 0] += 1.0 / len(groups)
+        return self
+
     def channel_norms(self):
         """L2 norm of each input channel's contribution, as a 1-D tensor.
 
