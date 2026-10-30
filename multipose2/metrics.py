@@ -148,7 +148,9 @@ def average_precision(masks_true, masks_pred, threshold=[0.5, 0.75, 0.9]):
     return ap, tp, fp, fn
 
 
-F1_THRESHOLDS = np.arange(0.5, 1.0, 0.05)
+# rounded: np.arange(0.5, 1.0, 0.05) ends at 0.9500000000000004, which a
+# `<= 0.95` test excludes, silently averaging f1_50_95 over 0.50:0.90
+F1_THRESHOLDS = np.round(np.arange(0.5, 1.0, 0.05), 2)
 
 
 def pooled_f1(masks_true, masks_pred, threshold=None):
@@ -194,7 +196,8 @@ def pooled_f1(masks_true, masks_pred, threshold=None):
                          out=np.zeros(den.shape, dtype=np.float64))
 
     f1 = _safe(2. * TP, 2. * TP + FP + FN)
-    in_range = (threshold >= 0.5) & (threshold <= 0.95)
+    # tolerance, so caller-built ranges with the same float error count too
+    in_range = (threshold >= 0.5 - 1e-9) & (threshold <= 0.95 + 1e-9)
     return {
         "threshold": threshold,
         "tp": TP, "fp": FP, "fn": FN,

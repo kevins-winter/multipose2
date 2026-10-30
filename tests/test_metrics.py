@@ -26,6 +26,20 @@ def test_pooled_f1_perfect_prediction():
     assert r["n_true"] == 3 and r["n_pred"] == 3
 
 
+def test_f1_50_95_averages_all_ten_thresholds_including_095():
+    assert len(metrics.F1_THRESHOLDS) == 10
+    assert metrics.F1_THRESHOLDS[-1] == 0.95
+    # a prediction shifted by one pixel matches at low IoU and fails at high,
+    # so the mean depends on whether 0.95 is included
+    truth = [_labels(S, [(2, 22, 2, 22)])]
+    pred = [_labels(S, [(3, 23, 2, 22)])]
+    r = metrics.pooled_f1(truth, pred)
+    assert r["f1_50_95"] == pytest.approx(r["f1"].mean())
+    unrounded = metrics.pooled_f1(truth, pred,
+                                  threshold=np.arange(0.5, 1.0, 0.05))
+    assert unrounded["f1_50_95"] == pytest.approx(r["f1_50_95"])
+
+
 def test_pooled_f1_counts_spurious_masks_on_empty_images():
     """The failure mode per-image averaging hides: hallucinating on background."""
     truth = [TWO, ONE] + [EMPTY] * 6
