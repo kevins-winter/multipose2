@@ -579,3 +579,30 @@ Fixes (user approved):
   and not in the notebook.
 - Next pilot: check "adapter weights moved" is in the tenths, not thousandths,
   before reading any combo number. Checkpoint tag is `pilot2`/`full2`.
+
+### Pilot 2 (2026-10-30, measured, one seed, 30 epochs, whole model, adapter x100)
+
+| arm | loose F1 | strict F1 | precision | recall | FP | missed |
+|---|---|---|---|---|---|---|
+| he | 0.653 | 0.183 | 0.762 | 0.571 | 25 | 60 |
+| transcripts | 0.778 | 0.300 | 0.793 | 0.764 | 28 | 33 |
+| combo | 0.794 | 0.291 | 0.789 | 0.800 | 30 | 28 |
+| combo, H&E zeroed | 0.747 | 0.141 | 0.745 | 0.750 | 36 | 35 |
+| combo, transcripts zeroed | 0 | 0 | 0 | 0 | 0 | 140 |
+
+Paired bootstrap, 25 test crops: combo beats H&E (loose +0.141 [+0.034,
++0.276], strict +0.108 [+0.084, +0.145], recall +0.229 [+0.111, +0.361]);
+combo vs transcripts shows no detectable difference on any metric. Inside combo,
+zeroing H&E costs mostly strict F1 (-0.150 [-0.225, -0.071]) and little loose
+F1; zeroing transcripts collapses it to no detections. H&E adapter moved
+0.068 / 0.110 / 0.123 (above the ~0.05 decay-only floor). ~22 min per arm, 43%
+of it Drive checkpoint saves (~3.6 GB each in "all" mode): use resume_every=20
+for the full run.
+
+Reading, with caveats (one seed, pilot length, ~10 neuron crops, annotation
+protocol still unknown): dual > H&E, dual ≈ transcripts. Inside the dual model
+transcripts carry existence and H&E is used for boundaries, but transcripts alone
+reach the same boundary quality, so H&E is used, not shown necessary. The
+zero-transcripts collapse is partly out-of-distribution (never trained without
+them), so it shows dependence, not that H&E holds no information (H&E alone
+scores 0.653).
