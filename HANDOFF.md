@@ -509,41 +509,35 @@ Trial caveats to keep:
   arms. Pilot checkpoints are named `..._trial_pilot_...` so they never resume into
   full runs. A pilot is a plumbing check and first read, not a result.
 
-### Design rule added 2026-10-30: one modality is stock Cellpose-SAM after normalization
+### Current goal (2026-10-30): single modality vs. dual modality
 
-The user's requirement: with one modality, everything **after** normalization
-must perform and cost exactly as Cellpose-SAM did. Normalization stays the
-revised per-modality transform (§6, section 2b) for every run. The user
-explicitly rejected falling back to Cellpose's per-crop normalization; do not
-reintroduce it. Implemented as:
-- `adapter_type="none"` (`PassthroughInputAdapter`): no parameters, 1–3 channels,
-  zero-pads to 3. Forward is **bit-identical** to the stock forward (test), and no
-  gradient has to cross the trunk to reach an input adapter.
+The user's stated goal for now: show the **inherent advantage of dual modality
+over single modality**, not the merits of any architecture. Consequences, all
+implemented:
+
+- **One identical, minimal pipeline for every arm** (notebook 6c): Cellpose-SAM
+  behind a linear adapter, same stages, same split, seeds and scoring, the same
+  declared fitted normalization restricted to the arm's channels. Only the input
+  channels differ. No correction module in the trial. Keep it this simple; the
+  user asked for fundamental changes only, not more abstraction.
+- **Order independence.** `LinearInputAdapter.init_balanced(groups)` starts every
+  modality at equal weight (channel j of each modality → trunk channel j % 3,
+  weight 1/n). The identity init made the combo start as Cellpose on whichever
+  modality was listed first. With one 3-channel modality, balanced = identity =
+  Cellpose-SAM. Used by the trial and by cell 16 for `linear`. Cost: combo starts
+  as an even blend, further from SAM's training distribution; may understate
+  combo on short runs.
 - **Normalization modes are declared by the user, per modality**, in the config
-  cell (`modality_normalization`), next to `modality_dirs`. Required, no default,
-  in the library too (`ModalitySpec.mode`, `from_layout`). They used to be derived
-  from position (`PRIMARY` = first listed → `percentile`, others → `fixed`), which
-  swapped modes on reorder and gave a transcripts-only run `percentile` while the
-  trial's transcripts arm got `fixed`. Never derive a mode from position or guess
+  cell (`modality_normalization`). Required, no default, also in the library
+  (`ModalitySpec.mode`, `from_layout`). Never derive a mode from position or guess
   it from statistics.
-- `PRIMARY`/`PRIMARY_CH`/`OTHER_CH` are gone from the notebook. Baselines (6b)
-  run one zero-shot stock arm per modality (≤3 channels, `adapter_type="none"`)
-  and one `trained_without_<modality>` ablation per modality. The parity check
-  compares the untrained all-channel model with stock on fused channels 0–2,
-  which is what the identity-initialised adapter passes, not a modality choice.
-  The single-modality baselines cell (28) loops over modalities and now trains
-  with `modality_normalizer.subset(chans)`; it previously trained with per-crop
-  defaults while scoring with the fitted transform.
-- For H&E (`percentile` mode) the revised normalization happens to equal
-  `normalize_img(**normalize_default)` exactly (test). For transcripts it does not
-  (`fixed` / `log1p_fixed`), by design.
-- Notebook: `SINGLE_MODALITY = len(LAYOUT) == 1` (cell 12) switches training and
-  eval to no adapter, no corrections and `STOCK_STAGES` (train_seg defaults:
-  `all`, 1e-5, 100 epochs, warmup 10), keeping `normalize=modality_normalizer`.
-- Trial 6c: single-modality arms default to that recipe
-  (`TRIAL_SINGLE_MODALITY_RECIPE = "stock"`), normalized with
-  `modality_normalizer.subset(chans)`; `"matched"` restores the identical-pipeline
-  control. Stock vs combo changes inputs **and** pipeline; matched isolates inputs.
-- Shared notebook settings, not reset to stock: `batch_size` and
-  `min_train_masks` (data and memory, not algorithm). fp16 autocast actually runs
-  here, where upstream silently disabled it (§8).
+- `PRIMARY`/`OTHER_CH` are gone. Baselines (6b) run one zero-shot stock arm per
+  modality (`adapter_type="none"`) and one `trained_without_<modality>` ablation per
+  modality; the parity check follows what the default identity adapter passes
+  (channels 0–2), not a modality.
+- **Removed, superseded by the goal:** the "one modality ⇒ stock Cellpose recipe"
+  switch (`SINGLE_MODALITY`, `STOCK_STAGES`), the trial's stock/matched and
+  corrections options, and the separate single-modality baselines cell (the trial
+  covers it, correctly normalized). `adapter_type="none"` stays in the library,
+  tested bit-identical to stock; 6b uses it for zero-shot.
+- The correction arms (§5) are untouched in the library but not part of this goal.
