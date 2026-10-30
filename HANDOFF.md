@@ -551,3 +551,31 @@ implemented:
   covers it, correctly normalized). `adapter_type="none"` stays in the library,
   tested bit-identical to stock; 6b uses it for zero-shot.
 - The correction arms (§5) are untouched in the library but not part of this goal.
+
+### First pilot (2026-10-30, measured) and what changed because of it
+
+Zero-shot baselines (6b), 25 test crops, 140 GT neurons: H&E 0/140 matched
+(1,465 predictions, median 6 px vs GT 34 px: Cellpose-SAM outlines nuclei, not
+somata, on H&E; registration verified visually, it is fine); transcripts F1-50
+0.497; parity OK. Only 65 of 188 training crops contain a neuron.
+
+Pilot 1 (old 3-stage schedule, 15+3+2 epochs, adapter at 1e-5), one seed,
+~8 min per arm measured: H&E 0.000, transcripts 0.652, combo 0.111,
+combo without H&E 0.538, combo without transcripts 0.000. **Not a result.**
+Adapter weights moved ~0.002 from the balanced start, so combo stayed a fixed
+50/50 blend, which nothing downstream can unmix; and the mostly frozen encoder
+never unlearned nuclei on H&E.
+
+Fixes (user approved):
+- `train_seg(adapter_lr_scale=...)`: the input adapter gets its own learning
+  rate (`_param_groups`, `lr_scale` per group). Adam moves each weight ~lr per
+  step regardless of gradient, so at 1e-5 the adapter cannot leave its init.
+- Trial schedule: one stage, `trainable_mode="all"`, 1e-5 (Cellpose's own
+  fine-tune), pilot 30 epochs / full 100, adapter x100.
+- Trial output now splits loose F1 (IoU 0.5, existence), strict F1 (IoU
+  0.75-0.95, boundary), precision / false positives (extraneous, suppressed) and
+  recall / missed (existence), with paired bootstrap intervals for each. That is
+  the behavioural version of the role characterization; `roles.py` is untouched
+  and not in the notebook.
+- Next pilot: check "adapter weights moved" is in the tenths, not thousandths,
+  before reading any combo number. Checkpoint tag is `pilot2`/`full2`.
