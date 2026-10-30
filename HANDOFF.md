@@ -526,6 +526,14 @@ reintroduce it. Implemented as:
   swapped modes on reorder and gave a transcripts-only run `percentile` while the
   trial's transcripts arm got `fixed`. Never derive a mode from position or guess
   it from statistics.
+- `PRIMARY`/`PRIMARY_CH`/`OTHER_CH` are gone from the notebook. Baselines (6b)
+  run one zero-shot stock arm per modality (≤3 channels, `adapter_type="none"`)
+  and one `trained_without_<modality>` ablation per modality. The parity check
+  compares the untrained all-channel model with stock on fused channels 0–2,
+  which is what the identity-initialised adapter passes, not a modality choice.
+  The single-modality baselines cell (28) loops over modalities and now trains
+  with `modality_normalizer.subset(chans)`; it previously trained with per-crop
+  defaults while scoring with the fitted transform.
 - For H&E (`percentile` mode) the revised normalization happens to equal
   `normalize_img(**normalize_default)` exactly (test). For transcripts it does not
   (`fixed` / `log1p_fixed`), by design.
