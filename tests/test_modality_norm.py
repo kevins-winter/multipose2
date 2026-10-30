@@ -166,6 +166,40 @@ def test_channel_report_flags_dead_channels():
     assert rows[3]["dead"] is True
 
 
+def test_survey_reports_the_fraction_of_crops_where_a_channel_dies():
+    # one dense crop and two sparse ones: the first crop alone looks healthy
+    rng = np.random.default_rng(0)
+    imgs = [np.concatenate([_he(rng), _counts(n=n, seed=i)], axis=0)
+            for i, n in enumerate((1800, 15, 15))]
+    norm = ModalityNormalizer.from_layout([
+        {"name": "he", "n_channels": 3, "mode": "percentile"},
+        {"name": "tx", "n_channels": 1, "mode": "percentile"},
+    ])
+    assert not norm.channel_report(imgs[0])[3]["dead"]
+    s = norm.survey(imgs)
+    assert s["n_images"] == 3
+    assert s["channels"][3]["n_dead"] == 2
+    assert s["channels"][3]["frac_dead"] == pytest.approx(2 / 3)
+    assert all(r["n_dead"] == 0 for r in s["channels"][:3])
+    assert s["duplicates"] == []
+
+
+def test_survey_finds_channels_duplicated_by_jpeg_inflation():
+    rng = np.random.default_rng(0)
+    imgs = []
+    for i in range(2):
+        tx = _counts(n=400, seed=i)
+        # a single-channel render read back from JPEG: three identical copies
+        imgs.append(np.concatenate([_he(rng), tx, tx, tx], axis=0))
+    norm = ModalityNormalizer.from_layout([
+        {"name": "he", "n_channels": 3, "mode": "percentile"},
+        {"name": "tx", "n_channels": 3, "mode": "percentile"},
+    ])
+    s = norm.survey(imgs, channel_axis=0)
+    assert [d["channels"] for d in s["duplicates"]] == [(3, 4), (3, 5), (4, 5)]
+    assert all(d["frac_identical"] == 1.0 for d in s["duplicates"])
+
+
 def test_train_seg_rejects_an_unfitted_normalizer():
     norm = _layout()
     with pytest.raises(ValueError, match="unfitted modes"):

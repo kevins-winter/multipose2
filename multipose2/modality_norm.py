@@ -282,6 +282,56 @@ class ModalityNormalizer:
                          "dead": float(norm[c].std()) == 0.})
         return rows
 
+    def survey(self, images, channel_axis=0):
+        """channel_report over a whole dataset, summarized per channel.
+
+        Both failures this looks for are crop-dependent. A sparse transcript
+        channel dies under per-crop percentiles in sparse crops and survives in
+        dense ones, so one crop can report all-clear while a third of the
+        training set is single-modality in practice. Report the fraction.
+
+        Duplicated channels are counted too, since a duplicate has healthy
+        variance and channel_report reads it as alive. Dead and duplicated have
+        different fixes (change the mode, re-render as .tif), and a channel can
+        be both.
+
+        Returns:
+            dict: ``n_images``; ``channels``, one row per channel with
+            ``modality``, ``mode``, ``n_dead``, ``frac_dead``,
+            ``median_raw_std`` and ``median_norm_std``; and ``duplicates``, one
+            row per channel pair identical in at least one image, with
+            ``n_identical`` and ``frac_identical``.
+        """
+        n = 0
+        dead = np.zeros(self.n_channels, int)
+        raw_std = [[] for _ in range(self.n_channels)]
+        norm_std = [[] for _ in range(self.n_channels)]
+        identical = {}
+        for img in images:
+            n += 1
+            for r in self.channel_report(img, channel_axis=channel_axis):
+                c = r["channel"]
+                dead[c] += r["dead"]
+                raw_std[c].append(r["raw_std"])
+                norm_std[c].append(r["norm_std"])
+            raw = np.moveaxis(np.asarray(img), channel_axis, 0)
+            for a in range(self.n_channels):
+                for b in range(a + 1, self.n_channels):
+                    if np.array_equal(raw[a], raw[b]):
+                        identical[(a, b)] = identical.get((a, b), 0) + 1
+        if n == 0:
+            raise ValueError("survey needs at least one image")
+        owner = {c: spec for spec in self.specs for c in spec.channels}
+        channels = [{"channel": c, "modality": owner[c].name,
+                     "mode": owner[c].mode, "n_dead": int(dead[c]),
+                     "frac_dead": dead[c] / n,
+                     "median_raw_std": float(np.median(raw_std[c])),
+                     "median_norm_std": float(np.median(norm_std[c]))}
+                    for c in range(self.n_channels)]
+        duplicates = [{"channels": pair, "n_identical": k, "frac_identical": k / n}
+                      for pair, k in sorted(identical.items())]
+        return {"n_images": n, "channels": channels, "duplicates": duplicates}
+
     def to_dict(self):
         return {"n_channels": self.n_channels,
                 "specs": [dataclasses.asdict(spec) for spec in self.specs]}
