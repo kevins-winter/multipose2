@@ -36,14 +36,23 @@ def test_from_layout_assigns_channels_in_order():
 
 def test_overlapping_and_missing_channels_are_rejected():
     with pytest.raises(ValueError, match="claimed by both"):
-        ModalityNormalizer([ModalitySpec("a", (0, 1)), ModalitySpec("b", (1, 2))])
+        ModalityNormalizer([ModalitySpec("a", (0, 1), "percentile"),
+                            ModalitySpec("b", (1, 2), "percentile")])
     with pytest.raises(ValueError, match="not covered"):
-        ModalityNormalizer([ModalitySpec("a", (0,)), ModalitySpec("b", (2,))])
+        ModalityNormalizer([ModalitySpec("a", (0,), "percentile"),
+                            ModalitySpec("b", (2,), "percentile")])
 
 
 def test_unknown_mode_is_rejected():
     with pytest.raises(ValueError, match="mode must be one of"):
         ModalitySpec("a", (0,), mode="zscore")
+
+
+def test_a_modality_must_declare_its_mode():
+    with pytest.raises(ValueError, match="declares no normalization mode"):
+        ModalityNormalizer.from_layout([{"name": "tx", "n_channels": 1}])
+    with pytest.raises(TypeError):
+        ModalitySpec("tx", (0,))
 
 
 def test_applying_an_unfitted_global_mode_raises():

@@ -59,14 +59,16 @@ class ModalitySpec:
     Attributes:
         name (str): Modality name, for reporting and for the stored manifest.
         channels (tuple of int): Indices of this modality in the fused stack.
-        mode (str): One of MODES.
+        mode (str): One of MODES. Required: it depends on what the data
+            physically is (a stain, a render, counts), which only the user
+            knows, so there is no default to fall back on silently.
         params (dict): Mode configuration, defaulted from DEFAULT_PARAMS.
         fitted (dict): Parameters measured by fit(); empty until then.
     """
 
     name: str
     channels: tuple
-    mode: str = "percentile"
+    mode: str
     params: dict = dataclasses.field(default_factory=dict)
     fitted: dict = dataclasses.field(default_factory=dict)
 
@@ -164,8 +166,8 @@ class ModalityNormalizer:
 
         Args:
             layout (sequence of dict): Each with ``name``, either ``channels``
-                (explicit indices) or ``n_channels`` (assigned in order), and
-                optionally ``mode`` and ``params``. The order must match the
+                (explicit indices) or ``n_channels`` (assigned in order),
+                ``mode``, and optionally ``params``. The order must match the
                 order the modalities were fused in.
 
         Returns:
@@ -178,8 +180,12 @@ class ModalityNormalizer:
                 n = int(entry["n_channels"])
                 channels = tuple(range(start, start + n))
             start = max(start, max(channels) + 1)
+            if "mode" not in entry:
+                raise ValueError(
+                    f"modality {entry['name']!r} declares no normalization mode; "
+                    f"choose one of {MODES} for what its channels contain")
             specs.append(ModalitySpec(name=entry["name"], channels=channels,
-                                      mode=entry.get("mode", "percentile"),
+                                      mode=entry["mode"],
                                       params=entry.get("params")))
         return cls(specs)
 

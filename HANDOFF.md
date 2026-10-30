@@ -519,6 +519,13 @@ reintroduce it. Implemented as:
 - `adapter_type="none"` (`PassthroughInputAdapter`): no parameters, 1–3 channels,
   zero-pads to 3. Forward is **bit-identical** to the stock forward (test), and no
   gradient has to cross the trunk to reach an input adapter.
+- **Normalization modes are declared by the user, per modality**, in the config
+  cell (`modality_normalization`), next to `modality_dirs`. Required, no default,
+  in the library too (`ModalitySpec.mode`, `from_layout`). They used to be derived
+  from position (`PRIMARY` = first listed → `percentile`, others → `fixed`), which
+  swapped modes on reorder and gave a transcripts-only run `percentile` while the
+  trial's transcripts arm got `fixed`. Never derive a mode from position or guess
+  it from statistics.
 - For H&E (`percentile` mode) the revised normalization happens to equal
   `normalize_img(**normalize_default)` exactly (test). For transcripts it does not
   (`fixed` / `log1p_fixed`), by design.
